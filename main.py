@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-import sys, os, re, threading, json, math
+import sys, os, re, threading, json, math, base64
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from functools import partial
+from urllib.parse import urlparse, parse_qs
 import subprocess
 
 def pip_install(pkg):
@@ -22,6 +23,8 @@ from PyQt6.QtCore    import *
 from PyQt6.QtGui     import *
 
 DATA_FILE = Path(__file__).parent / 'data.json'
+
+# ─────────────────────────── Console redirection ────────────────────────────
 
 class ConsoleStream(QObject):
     text_written = pyqtSignal(str)
@@ -50,13 +53,34 @@ _S_ERR    = ConsoleStream(_ORIG_ERR)
 sys.stdout = _S_OUT
 sys.stderr = _S_ERR
 
+# ─────────────────────────── Persistence ────────────────────────────────────
+
 def load_data():
     if DATA_FILE.exists():
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except: pass
-    return {'nav_position': 'top', 'history': [], 'bg_animate': True}
+                d = json.load(f)
+                defaults = {
+                    'nav_position':       'top',
+                    'history':            [],
+                    'bg_animate':         True,
+                    'cursor_color':       '#3b82f6',
+                    'top_glow_color':     '#3b82f6',
+                    'corner_glow_color':  '#7c3aed',
+                }
+                for k, v in defaults.items():
+                    d.setdefault(k, v)
+                return d
+        except:
+            pass
+    return {
+        'nav_position':       'top',
+        'history':            [],
+        'bg_animate':         True,
+        'cursor_color':       '#3b82f6',
+        'top_glow_color':     '#3b82f6',
+        'corner_glow_color':  '#7c3aed',
+    }
 
 def save_data(d):
     try:
@@ -64,6 +88,37 @@ def save_data(d):
             json.dump(d, f, indent=2, ensure_ascii=False)
     except Exception as e:
         _ORIG_OUT.write(f'[Nexus] save_data error: {e}\n')
+
+# ─────────────────────────── URL helpers ────────────────────────────────────
+
+def normalize_video_url(url: str) -> str:
+    url = url.strip()
+    try:
+        parsed = urlparse(url)
+        if 'youtu.be' in parsed.netloc:
+            vid_id = parsed.path.strip('/')
+            if not vid_id:
+                return url
+            params = parse_qs(parsed.query)
+            t = params.get('t', [None])[0]
+            clean = f"https://www.youtube.com/watch?v={vid_id}"
+            if t:
+                clean += f"&t={t}"
+            return clean
+        if 'youtube.com' in parsed.netloc and '/watch' in parsed.path:
+            params = parse_qs(parsed.query)
+            vid_id = params.get('v', [None])[0]
+            if vid_id:
+                t = params.get('t', [None])[0]
+                clean = f"https://www.youtube.com/watch?v={vid_id}"
+                if t:
+                    clean += f"&t={t}"
+                return clean
+    except Exception:
+        pass
+    return url
+
+# ─────────────────────────── Theme ──────────────────────────────────────────
 
 C = {
     'bg'      : '#09090b',
@@ -415,24 +470,62 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
 QScrollBar:horizontal {{ height:5px; background:transparent; }}
 QScrollBar::handle:horizontal {{ background:{C['bg3']}; border-radius:2px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0; }}
+
+QCheckBox {{
+    spacing: 0px;
+    color: {C['txt']};
+}}
+QCheckBox::indicator {{
+    width: 24px;
+    height: 24px;
+    border: 2px solid {C['border2']};
+    border-radius: 7px;
+    background: {C['bg3']};
+}}
+QCheckBox::indicator:hover {{
+    border-color: {C['accent']};
+    background: rgba(59,130,246,0.10);
+}}
+QCheckBox::indicator:checked {{
+    background: {C['accent']};
+    border-color: {C['accent']};
+}}
+QCheckBox::indicator:checked:hover {{
+    background: {C['accent2']};
+    border-color: {C['accent2']};
+}}
 """
 
+# ────────────────────── Animated background ─────────────────────────────────
+
 class AnimatedSquaresBg(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None,
+                 top_glow_color: str = '#3b82f6',
+                 corner_glow_color: str = '#7c3aed'):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self._enabled  = True
-        self._offset_x = 0.0
-        self._offset_y = 0.0
-        self._speed_x  = 0.22
-        self._speed_y  = 0.13
-        self._timer    = QTimer(self)
+        self._enabled       = True
+        self._offset_x      = 0.0
+        self._offset_y      = 0.0
+        self._speed_x       = 0.22
+        self._speed_y       = 0.13
+        self._top_color     = QColor(top_glow_color)
+        self._corner_color  = QColor(corner_glow_color)
+        self._timer         = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(16)
 
     def set_enabled(self, val: bool):
         self._enabled = val
+        self.update()
+
+    def set_top_glow_color(self, hex_color: str):
+        self._top_color = QColor(hex_color)
+        self.update()
+
+    def set_corner_glow_color(self, hex_color: str):
+        self._corner_color = QColor(hex_color)
         self.update()
 
     def _tick(self):
@@ -458,33 +551,44 @@ class AnimatedSquaresBg(QWidget):
         while y <= self.height() + 48:
             p.drawLine(0, int(y), self.width(), int(y))
             y += 48
+
+        tc = QColor(self._top_color)
         g1 = QRadialGradient(self.width() // 2, -40, 440)
-        g1.setColorAt(0, QColor(59, 130, 246, 22))
+        g1.setColorAt(0, QColor(tc.red(), tc.green(), tc.blue(), 22))
         g1.setColorAt(1, QColor(0, 0, 0, 0))
         p.setBrush(g1)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(self.width() // 2 - 440, -200, 880, 500)
+
+        cc = QColor(self._corner_color)
         g2 = QRadialGradient(self.width(), self.height(), 300)
-        g2.setColorAt(0, QColor(124, 58, 237, 22))
+        g2.setColorAt(0, QColor(cc.red(), cc.green(), cc.blue(), 22))
         g2.setColorAt(1, QColor(0, 0, 0, 0))
         p.setBrush(g2)
         p.drawEllipse(self.width() - 320, self.height() - 320, 640, 640)
         p.end()
 
 
+# ────────────────────── Cursor glow ─────────────────────────────────────────
+
 class CursorGlow(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, color: str = '#3b82f6'):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self._pos     = QPointF(-500, -500)
-        self._alpha   = 0.0
-        self._target  = 0.0
-        self._radius  = 130.0
+        self._pos      = QPointF(-500, -500)
+        self._alpha    = 0.0
+        self._target   = 0.0
+        self._radius   = 130.0
         self._r_target = 130.0
+        self._color    = QColor(color)
         t = QTimer(self)
         t.timeout.connect(self._tick)
         t.start(16)
+
+    def set_color(self, hex_color: str):
+        self._color = QColor(hex_color)
+        self.update()
 
     def move_to(self, pos: QPoint):
         self._pos    = QPointF(pos.x(), pos.y())
@@ -495,12 +599,12 @@ class CursorGlow(QWidget):
         self._target = 0.0
 
     def click_flash(self):
-        self._target  = 90.0
+        self._target   = 90.0
         self._r_target = 180.0
         QTimer.singleShot(500, self._restore_glow)
 
     def _restore_glow(self):
-        self._target  = 35.0
+        self._target   = 35.0
         self._r_target = 130.0
 
     def _tick(self):
@@ -522,10 +626,11 @@ class CursorGlow(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         cx, cy = self._pos.x(), self._pos.y()
-        r = self._radius
-        g = QRadialGradient(cx, cy, r)
-        g.setColorAt(0,    QColor(59, 130, 246, int(self._alpha)))
-        g.setColorAt(0.45, QColor(59, 130, 246, int(self._alpha * 0.35)))
+        r  = self._radius
+        c  = self._color
+        g  = QRadialGradient(cx, cy, r)
+        g.setColorAt(0,    QColor(c.red(), c.green(), c.blue(), int(self._alpha)))
+        g.setColorAt(0.45, QColor(c.red(), c.green(), c.blue(), int(self._alpha * 0.35)))
         g.setColorAt(1,    QColor(0, 0, 0, 0))
         p.setBrush(QBrush(g))
         p.setPen(Qt.PenStyle.NoPen)
@@ -533,125 +638,179 @@ class CursorGlow(QWidget):
         p.end()
 
 
+# ────────────────────── Colour picker button ────────────────────────────────
+
+class ColorPickerBtn(QPushButton):
+    color_changed = pyqtSignal(str)
+
+    def __init__(self, color: str = '#3b82f6', parent=None):
+        super().__init__(parent)
+        self._color = color
+        self.setFixedSize(44, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clicked.connect(self._pick)
+        self._refresh()
+
+    def _refresh(self):
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {self._color};
+                border: 2px solid rgba(255,255,255,0.18);
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid rgba(255,255,255,0.55);
+            }}
+        """)
+
+    def _pick(self):
+        c = QColorDialog.getColor(QColor(self._color), self, 'Choose Colour',
+                                   QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if c.isValid():
+            self._color = c.name()
+            self._refresh()
+            self.color_changed.emit(self._color)
+
+    def color(self) -> str:
+        return self._color
+
+    def set_color(self, hex_color: str):
+        self._color = hex_color
+        self._refresh()
+
+
+# ────────────────────── Splash  (HTML-matched stroke-draw → fill+glow) ──────
+
 class HelloSplash(QWidget):
     """
-    Premium intro animation:
-      Phase 0 — stroke of word draws left-to-right along the actual outline path
-      Phase 1 — fill fades in (same blue as stroke)
-      Phase 2 — hold
-      Phase 3 — whole word fades out
-      repeat for 'Nexus', then emit finished
+    Replicates the HTML animation exactly:
+      Phase 0 – stroke draws along the glyph outline  (like stroke-dashoffset → 0)
+      Phase 1 – fill fades in                          (like fillIn keyframe)
+      Phase 2 – glow intensifies + subtitle appears    (drop-shadow)
+      Phase 3 – whole word fades out
+      Then repeats for 'Nexus', then emits finished.
+
+    Key technique: QPainterPath.toFillPolygons() gives us the outline.
+    We walk a *flattened* version of the outline path and draw an
+    ever-growing sub-path — identical to the CSS stroke-dashoffset trick.
     """
+
+    # ── Tuning ────────────────────────────────────────────────────────────────
+    FONT_PX      = 130          # px size – matches HTML ~5 rem on 1300-wide window
+    DRAW_SPEED   = 0.006        # fraction of outline drawn per 16 ms tick  (~2.6 s total)
+    FILL_SPEED   = 0.030        # fill alpha increment per tick              (~0.9 s)
+    GLOW_SPEED   = 0.025        # glow strength increment
+    HOLD_TICKS   = 75           # ticks to hold after full glow (~1.2 s)
+    FADE_SPEED   = 0.032        # whole-word fade-out speed
+
+    # Colours matching the HTML (#B87333 copper / #FF8C00 orange-glow)
+    STROKE_COLOR = QColor(0x60, 0xa5, 0xfa)          # blue accent – Nexus brand
+    FILL_COLOR   = QColor(0x60, 0xa5, 0xfa)
+    GLOW_COLOR   = QColor(0x3b, 0x82, 0xf6, 0)
+
     finished = pyqtSignal()
-    FONT_PX   = 136
-    SPEED_STR = 0.007   # stroke draw speed per tick (0–1)
-    SPEED_FIL = 0.028   # fill fade speed per tick
-    HOLD_TICK = 60      # frames to hold after fill
-    FADE_SPD  = 0.038   # whole-word fade speed
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"background:{C['bg']};")
-        self._phase       = 0
-        self._ticks       = 0
-        self._phase_start = 0
-        self._stroke_t    = 0.0   # 0..1 along the outline
-        self._fill_alpha  = 0.0   # 0..1
-        self._whole_alpha = 1.0   # 1..0 (fade out)
-        self._word        = 'Hello'
-        self._paths       = {}
+
+        self._word         = 'Hello'
+        self._phase        = 0       # 0=draw 1=fill 2=glow+hold 3=fadeout 4=done
+        self._ticks        = 0
+        self._phase_start  = 0
+        self._draw_t       = 0.0     # 0..1  how much of the outline is drawn
+        self._fill_alpha   = 0.0     # 0..1
+        self._glow_str     = 0.0     # 0..1
+        self._whole_alpha  = 1.0
+
+        self._cache: dict[str, dict] = {}
         self._precompute('Hello')
         self._precompute('Nexus')
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(16)
 
-    # ── path pre-computation ──────────────────────────────────────────────────
+    # ── Font ─────────────────────────────────────────────────────────────────
 
-    def _make_font(self):
-        f = QFont('Outfit', 1)
+    def _make_font(self) -> QFont:
+        f = QFont()
+        # Prefer Outfit (loaded from Google Fonts in HTML); fall back gracefully
+        for family in ('Outfit', 'Segoe UI', 'Ubuntu', 'Arial'):
+            f.setFamily(family)
+            if QFontInfo(f).family().lower() == family.lower():
+                break
         f.setWeight(QFont.Weight.Bold)
         f.setPixelSize(self.FONT_PX)
         return f
 
-    def _precompute(self, word):
-        """
-        Build:
-          fill_path  — QPainterPath for solid fill, centred at (0,0)
-          edge_pts   — list of (x,y) that travel the *outline* of all glyphs
-                       in one continuous sequence, left-to-right ordered
-        """
+    # ── Pre-compute outline path & flat point list ────────────────────────────
+
+    def _precompute(self, word: str):
         font = self._make_font()
-        # raw path at origin
+
+        # Build the fill path (centred at origin)
         raw = QPainterPath()
         raw.addText(0, 0, font, word)
         br = raw.boundingRect()
+        path = QPainterPath()
+        path.addText(-br.x(), -br.y(), font, word)
 
-        # translate so top-left is at (0,0)
-        fill_path = QPainterPath()
-        fill_path.addText(-br.x(), -br.y(), font, word)
-
-        # collect outline polygons; each sub-path is one glyph contour
-        polys = fill_path.toSubpathPolygons()
-
-        # sort contours by leftmost x so stroke travels left → right
-        def poly_left(poly):
-            return min(poly[i].x() for i in range(poly.count()))
-        polys_sorted = sorted(polys, key=poly_left)
-
-        # flatten into a single ordered point list
-        edge_pts = []
-        for poly in polys_sorted:
+        # Flatten the outline into a dense list of (x,y) points
+        # QPainterPath.toSubpathPolygons gives us the outline polygons
+        flat: list[tuple[float, float]] = []
+        for poly in path.toSubpathPolygons():
             n = poly.count()
+            if n == 0:
+                continue
             for i in range(n):
-                edge_pts.append((poly[i].x(), poly[i].y()))
-            # close the contour back to its start
-            if n > 0:
-                edge_pts.append((poly[0].x(), poly[0].y()))
+                flat.append((poly[i].x(), poly[i].y()))
+            # close each sub-path back to its start
+            flat.append((poly[0].x(), poly[0].y()))
 
-        bounds = fill_path.boundingRect()
-        self._paths[word] = {
-            'fill': fill_path,
-            'pts':  edge_pts,
-            'w':    bounds.width(),
-            'h':    bounds.height(),
+        bounds = path.boundingRect()
+        self._cache[word] = {
+            'path' : path,
+            'pts'  : flat,
+            'w'    : bounds.width(),
+            'h'    : bounds.height(),
         }
 
-    # ── animation state machine ───────────────────────────────────────────────
+    # ── Animation tick ────────────────────────────────────────────────────────
 
     def _tick(self):
         self._ticks += 1
         elapsed = self._ticks - self._phase_start
 
-        if self._phase == 0:                        # drawing stroke
-            self._stroke_t = min(1.0, self._stroke_t + self.SPEED_STR)
-            if self._stroke_t >= 1.0:
+        if self._phase == 0:                          # stroke drawing
+            self._draw_t = min(1.0, self._draw_t + self.DRAW_SPEED)
+            if self._draw_t >= 1.0:
                 self._phase = 1; self._phase_start = self._ticks
 
-        elif self._phase == 1:                      # filling
-            self._fill_alpha = min(1.0, self._fill_alpha + self.SPEED_FIL)
+        elif self._phase == 1:                        # fill fade-in
+            self._fill_alpha = min(1.0, self._fill_alpha + self.FILL_SPEED)
             if self._fill_alpha >= 1.0:
                 self._phase = 2; self._phase_start = self._ticks
 
-        elif self._phase == 2:                      # hold
-            if elapsed >= self.HOLD_TICK:
+        elif self._phase == 2:                        # glow build + hold
+            self._glow_str = min(1.0, self._glow_str + self.GLOW_SPEED)
+            if elapsed >= self.HOLD_TICKS:
                 self._phase = 3; self._phase_start = self._ticks
 
-        elif self._phase == 3:                      # fading out
-            self._whole_alpha = max(0.0, self._whole_alpha - self.FADE_SPD)
+        elif self._phase == 3:                        # fade out
+            self._whole_alpha = max(0.0, self._whole_alpha - self.FADE_SPEED)
             if self._whole_alpha <= 0.0:
                 if self._word == 'Hello':
-                    self._word        = 'Nexus'
-                    self._stroke_t    = 0.0
-                    self._fill_alpha  = 0.0
-                    self._whole_alpha = 1.0
-                    self._phase       = 0
-                    self._phase_start = self._ticks
+                    # reset for Nexus
+                    self._word = 'Nexus'
+                    self._draw_t = 0.0; self._fill_alpha = 0.0
+                    self._glow_str = 0.0; self._whole_alpha = 1.0
+                    self._phase = 0; self._phase_start = self._ticks
                 else:
                     self._phase = 4; self._phase_start = self._ticks
 
-        elif self._phase == 4:                      # brief blank then done
-            if elapsed > 12:
+        elif self._phase == 4:
+            if elapsed > 15:
                 self._timer.stop()
                 save_data(load_data())
                 self.finished.emit()
@@ -659,30 +818,33 @@ class HelloSplash(QWidget):
 
         self.update()
 
-    # ── painting ──────────────────────────────────────────────────────────────
+    # ── Paint ─────────────────────────────────────────────────────────────────
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        # Background
         p.fillRect(self.rect(), QColor(C['bg']))
 
-        # soft blue ambient glow centred on canvas
-        glow_r = max(self.width(), self.height()) * 0.55
-        bg_g   = QRadialGradient(self.width() / 2, self.height() / 2, glow_r)
-        bg_g.setColorAt(0, QColor(59, 130, 246, int(16 * self._whole_alpha)))
+        # Subtle radial bg glow (matches HTML body dark blue)
+        bg_r = max(self.width(), self.height()) * 0.6
+        bg_g = QRadialGradient(self.width() / 2, self.height() / 2, bg_r)
+        bg_g.setColorAt(0, QColor(20, 30, 60, int(30 * self._whole_alpha)))
         bg_g.setColorAt(1, QColor(0, 0, 0, 0))
-        p.setBrush(bg_g); p.setPen(Qt.PenStyle.NoPen); p.drawRect(self.rect())
+        p.setBrush(bg_g); p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(self.rect())
 
-        cache = self._paths.get(self._word)
+        cache = self._cache.get(self._word)
         if not cache:
             p.end(); return
 
-        fill_path = cache['fill']
+        fill_path = cache['path']
         pts       = cache['pts']
-        pw        = cache['w']
-        ph        = cache['h']
+        pw, ph    = cache['w'], cache['h']
 
-        # centre translation
+        # Centre in window
         tx = (self.width()  - pw) / 2
         ty = (self.height() - ph) / 2
 
@@ -690,66 +852,99 @@ class HelloSplash(QWidget):
         p.translate(tx, ty)
         p.setOpacity(self._whole_alpha)
 
-        # ── 1. solid fill (fades in) ──────────────────────────────────────────
+        # ── 1. Glow halo behind the text (drop-shadow effect) ─────────────────
+        if self._glow_str > 0:
+            glow_radius = int(40 + 30 * self._glow_str)
+            for radius, alpha in [(glow_radius, int(55 * self._glow_str)),
+                                  (glow_radius // 2, int(90 * self._glow_str))]:
+                # draw the filled path multiple times with expanding blur
+                # We simulate glow by drawing a slightly enlarged blurred fill
+                p.save()
+                glow_c = QColor(C['accent'])
+                glow_c.setAlpha(alpha)
+                p.setBrush(glow_c)
+                p.setPen(Qt.PenStyle.NoPen)
+                # Scale the path slightly outward to give glow spread
+                scale = 1.0 + radius / 400.0
+                cx_path = pw / 2; cy_path = ph / 2
+                p.translate(cx_path, cy_path)
+                p.scale(scale, scale)
+                p.translate(-cx_path, -cy_path)
+                p.drawPath(fill_path)
+                p.restore()
+
+        # ── 2. Filled text (fades in — matches CSS fillIn) ────────────────────
         if self._fill_alpha > 0:
-            fc = QColor(C['accent2'])
-            fc.setAlpha(int(255 * self._fill_alpha))
-            p.setBrush(fc); p.setPen(Qt.PenStyle.NoPen)
+            fill_c = QColor(self.FILL_COLOR)
+            fill_c.setAlpha(int(255 * self._fill_alpha))
+            p.setBrush(fill_c)
+            p.setPen(Qt.PenStyle.NoPen)
             p.drawPath(fill_path)
 
-        # ── 2. stroke drawn progressively along outline ───────────────────────
-        if pts and self._stroke_t > 0:
+        # ── 3. Stroke drawing along the outline ───────────────────────────────
+        if pts and self._draw_t > 0:
             total   = len(pts)
-            visible = max(2, int(total * self._stroke_t))
+            visible = max(2, int(total * self._draw_t))
 
             stroke_path = QPainterPath()
             stroke_path.moveTo(pts[0][0], pts[0][1])
             for i in range(1, visible):
                 stroke_path.lineTo(pts[i][0], pts[i][1])
 
-            # glow halo behind stroke
-            halo_pen = QPen(QColor(59, 130, 246, 55), 8)
+            # Outer halo (wider, dim) – mimics the HTML glow on the stroke
+            halo_pen = QPen(QColor(59, 130, 246, 45), 10)
             halo_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             halo_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(halo_pen); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(halo_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(stroke_path)
 
-            # main stroke
-            stroke_pen = QPen(QColor(C['accent2']), 3.0)
+            # Main stroke line (thin, bright – stroke-width:0.8px in HTML)
+            stroke_pen = QPen(self.STROKE_COLOR, 2.2)
             stroke_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             stroke_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             p.setPen(stroke_pen)
             p.drawPath(stroke_path)
 
-            # bright tip dot  
+            # ── Bright moving tip (pen nib effect) ───────────────────────────
             if visible >= 2:
                 lx, ly = pts[visible - 1]
-                tip_g = QRadialGradient(lx, ly, 16)
-                tip_g.setColorAt(0,   QColor(255, 255, 255, 240))
-                tip_g.setColorAt(0.3, QColor(96, 165, 250, 180))
+
+                # soft outer glow
+                tip_g = QRadialGradient(lx, ly, 18)
+                tip_g.setColorAt(0,   QColor(255, 255, 255, 230))
+                tip_g.setColorAt(0.3, QColor(100, 170, 255, 160))
                 tip_g.setColorAt(1,   QColor(0, 0, 0, 0))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(tip_g)
-                p.drawEllipse(QPointF(lx, ly), 16, 16)
+                p.drawEllipse(QPointF(lx, ly), 18, 18)
+
+                # bright core dot
                 p.setBrush(QColor(255, 255, 255, 255))
-                p.drawEllipse(QPointF(lx, ly), 3.5, 3.5)
+                p.drawEllipse(QPointF(lx, ly), 3.0, 3.0)
 
         p.restore()
 
-        # subtitle under Nexus when fully filled
-        if self._word == 'Nexus' and self._fill_alpha >= 1.0 and self._phase in (2,):
-            alpha = int(180 * self._whole_alpha)
-            f2 = QFont('Outfit', 1); f2.setPixelSize(15); f2.setWeight(QFont.Weight.Normal)
+        # ── 4. Subtitle under 'Nexus' once fully drawn ────────────────────────
+        if self._word == 'Nexus' and self._fill_alpha >= 1.0 and self._phase == 2:
+            sub_alpha = int(200 * min(1.0, self._glow_str) * self._whole_alpha)
+            f2 = self._make_font()
+            f2.setPixelSize(15)
+            f2.setWeight(QFont.Weight.Normal)
             p.setFont(f2)
-            sub_c = QColor(C['txt2']); sub_c.setAlpha(alpha); p.setPen(sub_c)
+            sub_c = QColor(C['txt2'])
+            sub_c.setAlpha(sub_alpha)
+            p.setPen(sub_c)
             sub_txt = 'YouTube Media Suite'
             fm  = QFontMetrics(f2)
-            sw  = fm.horizontalAdvance(sub_txt)
-            sub_y = int(self.height() / 2 + ph / 2 + 32)
-            p.drawText(int((self.width() - sw) / 2), sub_y, sub_txt)
+            sub_x = int((self.width() - fm.horizontalAdvance(sub_txt)) / 2)
+            sub_y = int(self.height() / 2 + ph / 2 + 36)
+            p.drawText(sub_x, sub_y, sub_txt)
 
         p.end()
 
+
+# ────────────────────── Workers ─────────────────────────────────────────────
 
 class VideoInfoWorker(QThread):
     info_ready = pyqtSignal(dict)
@@ -757,7 +952,8 @@ class VideoInfoWorker(QThread):
     def __init__(self, url): super().__init__(); self.url = url
     def run(self):
         try:
-            opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False, 'skip_download': True}
+            opts = {'quiet': True, 'no_warnings': True,
+                    'extract_flat': False, 'skip_download': True}
             with yt_dlp.YoutubeDL(opts) as y:
                 info = y.extract_info(self.url, download=False)
             print(f'[Nexus] Fetched: {info.get("title", "?")}')
@@ -771,29 +967,52 @@ class DownloadWorker(QThread):
     progress = pyqtSignal(float, str)
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
+
     def __init__(self, url, fmt, out_dir):
         super().__init__()
-        self.url = url; self.fmt = fmt; self.out_dir = out_dir
-        self._last_pct = 0.0; self._abort = False
+        self.url        = url
+        self.fmt        = fmt
+        self.out_dir    = out_dir
+        self._abort     = False
+        self._file_idx  = 0
+        self._n_files   = 2
+        self._seen_fids = set()
+
     def abort(self): self._abort = True
 
     def run(self):
         def hook(d):
-            if self._abort: raise Exception('Download aborted')
-            if d['status'] == 'downloading':
+            if self._abort:
+                raise Exception('Download aborted')
+            fname  = d.get('filename') or d.get('tmpfilename') or ''
+            status = d['status']
+            if fname and fname not in self._seen_fids:
+                self._seen_fids.add(fname)
+                self._n_files = max(self._n_files, len(self._seen_fids))
+            if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
                 dl    = d.get('downloaded_bytes', 0)
                 spd   = d.get('speed', 0) or 0
-                if total:
-                    pct = min(dl / total * 100, 99.0)
-                    if pct >= self._last_pct:
-                        self._last_pct = pct
+                if total and total > 0:
+                    slice_size = 96.0 / self._n_files
+                    base       = self._file_idx * slice_size
+                    file_pct   = min(dl / total * 100.0, 99.9)
+                    overall    = min(base + file_pct / 100.0 * slice_size, 96.0)
                     spd_s = (f"{spd/1048576:.1f} MB/s" if spd >= 1048576
                              else f"{spd/1024:.0f} KB/s" if spd else "—")
-                    self.progress.emit(self._last_pct, spd_s)
-            elif d['status'] == 'finished':
-                self._last_pct = 99.0
-                self.progress.emit(99.0, "Merging…")
+                    label = 'Downloading…'
+                    if self._file_idx == 1:   label = 'Downloading audio…'
+                    elif self._file_idx >= 2: label = 'Processing…'
+                    self.progress.emit(overall, f"{spd_s}  ·  {label}")
+            elif status == 'finished':
+                self._file_idx += 1
+                slice_size = 96.0 / self._n_files
+                done_pct   = min(self._file_idx * slice_size, 96.0)
+                if self._file_idx < self._n_files:
+                    self.progress.emit(done_pct, 'Downloading next stream…')
+                else:
+                    self.progress.emit(97.0, 'Merging & encoding…')
+
         try:
             os.makedirs(self.out_dir, exist_ok=True)
             opts = {
@@ -802,7 +1021,9 @@ class DownloadWorker(QThread):
                 'progress_hooks': [hook],
                 'quiet': True, 'no_warnings': True,
                 'merge_output_format': 'mp4',
-                'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
+                'postprocessors': [
+                    {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
+                ],
             }
             with yt_dlp.YoutubeDL(opts) as y:
                 info  = y.extract_info(self.url)
@@ -859,6 +1080,8 @@ class ThumbnailFetcher(QThread):
         except: pass
 
 
+# ────────────────────── Utility functions ───────────────────────────────────
+
 def fmt_size(b):
     if not b: return 'N/A'
     for u in ('B', 'KB', 'MB', 'GB'):
@@ -877,7 +1100,6 @@ def fmt_views(n):
     if n >= 1_000_000:     return f"{n/1_000_000:.1f}M views"
     if n >= 1_000:         return f"{n/1_000:.1f}K views"
     return f"{n} views"
-
 
 def fmt_likes(n):
     if not n: return '—'
@@ -925,6 +1147,8 @@ def sep_h():
     return f
 
 
+# ────────────────────── Small UI widgets ────────────────────────────────────
+
 class BreatheDot(QWidget):
     def __init__(self, color='#3b82f6', size=8, parent=None):
         super().__init__(parent)
@@ -966,14 +1190,19 @@ class SlimProgress(QWidget):
         super().__init__(parent)
         self._target = 0.0; self._visual = 0.0; self.setFixedHeight(4)
         t = QTimer(self); t.timeout.connect(self._step); t.start(16)
+
     def setValue(self, v):
-        v = max(self._target, float(v)); self._target = min(100.0, v)
+        self._target = min(100.0, max(0.0, float(v)))
+
     def value(self): return self._target
+
     def reset(self): self._target = 0.0; self._visual = 0.0; self.update()
+
     def _step(self):
         diff = self._target - self._visual
-        if abs(diff) > 0.05: self._visual += diff * 0.10; self.update()
+        if abs(diff) > 0.05: self._visual += diff * 0.12; self.update()
         elif self._visual != self._target: self._visual = self._target; self.update()
+
     def paintEvent(self, _):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -988,9 +1217,12 @@ class SlimProgress(QWidget):
                 if fw > 6:
                     dr = h + 2
                     gd = QRadialGradient(fw, h // 2, dr + 3)
-                    gd.setColorAt(0, QColor(59, 130, 246, 160)); gd.setColorAt(1, QColor(0, 0, 0, 0))
-                    p.setBrush(gd); p.drawEllipse(fw - dr - 3, h // 2 - dr - 3, (dr + 3) * 2, (dr + 3) * 2)
-                    p.setBrush(QColor(C['accent2'])); p.drawEllipse(fw - dr, h // 2 - dr, dr * 2, dr * 2)
+                    gd.setColorAt(0, QColor(59, 130, 246, 160))
+                    gd.setColorAt(1, QColor(0, 0, 0, 0))
+                    p.setBrush(gd)
+                    p.drawEllipse(fw - dr - 3, h // 2 - dr - 3, (dr + 3) * 2, (dr + 3) * 2)
+                    p.setBrush(QColor(C['accent2']))
+                    p.drawEllipse(fw - dr, h // 2 - dr, dr * 2, dr * 2)
         p.end()
 
 
@@ -1099,114 +1331,63 @@ class SearchBar(QWidget):
     def set_info(self, t):    self.status.show_info(t)
 
 
-class SingleVideoPage(QWidget):
+# ────────────────────── Video result card (single reusable widget) ───────────
+
+class VideoResultCard(QFrame):
+    """
+    A self-contained card that shows all video metadata + download controls.
+    Created once per fetched video; multiple cards stack vertically.
+    """
     download_saved = pyqtSignal(dict)
-    def __init__(self, parent=None):
+
+    def __init__(self, info: dict, parent=None):
         super().__init__(parent)
-        self._info = None; self._workers = {}; self._vid_ids = []; self._aud_ids = []
-        self._active_fmt = 'va'; self._hero_anim = None
+        self._info      = info
+        self._workers   = {}
+        self._vid_ids   = []
+        self._aud_ids   = []
+        self._active_fmt = 'va'
+        self.setObjectName('videoCard')
         self._build()
+        self._populate(info)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
     def _build(self):
-        scroll = QScrollArea(self); scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(scroll)
-        container = QWidget(); scroll.setWidget(container)
-        root = QVBoxLayout(container); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        cl = QHBoxLayout(self); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
 
-        # ── Hero ────────────────────────────────────────────────────────────────
-        self.hero = QWidget()
-        hl = QVBoxLayout(self.hero); hl.setContentsMargins(24, 80, 24, 40); hl.setSpacing(0)
-        hl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        badge = HeroBadge('YouTube Media Suite'); badge.setFixedWidth(210)
-        bw = QWidget(); bwl = QHBoxLayout(bw); bwl.setContentsMargins(0, 0, 0, 28)
-        bwl.addStretch(); bwl.addWidget(badge); bwl.addStretch(); hl.addWidget(bw)
-        title = QLabel('Download anything.\nInstantly.'); title.setObjectName('heroTitle')
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter); title.setWordWrap(True); hl.addWidget(title)
-        sub = QLabel('Videos, audio, playlists — all in one place.'); sub.setObjectName('heroSub')
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sw = QWidget(); swl = QHBoxLayout(sw); swl.setContentsMargins(0, 14, 0, 44)
-        swl.addStretch(); swl.addWidget(sub); swl.addStretch(); hl.addWidget(sw)
-        sbw = QWidget(); sbl = QHBoxLayout(sbw); sbl.setContentsMargins(0, 0, 0, 0)
-        self.search = SearchBar('🔗', 'Paste a YouTube link…'); self.search.setMaximumWidth(680)
-        self.search.submitted.connect(self._fetch)
-        sbl.addStretch(); sbl.addWidget(self.search, 0); sbl.addStretch(); hl.addWidget(sbw)
-        root.addWidget(self.hero)
-
-        # ── Result card ──────────────────────────────────────────────────────────
-        self.result_area = QWidget(); self.result_area.setVisible(False)
-        ra_l = QVBoxLayout(self.result_area); ra_l.setContentsMargins(24, 24, 24, 60); ra_l.setSpacing(0)
-        self.card = QFrame(); self.card.setObjectName('videoCard')
-        cl = QHBoxLayout(self.card); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
-
-        # Thumbnail pane
-        left = QWidget(); left.setFixedWidth(360)
+        # Left thumbnail column
+        left = QWidget(); left.setFixedWidth(320)
         left.setStyleSheet("background:#0a0a0e;border-radius:20px 0 0 20px;")
         ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0); ll.setSpacing(0)
-        self.thumb = ThumbWidget(360, 240); ll.addWidget(self.thumb)
-        dr = QHBoxLayout(); dr.setContentsMargins(12, 0, 12, 12)
+        self.thumb = ThumbWidget(320, 215); ll.addWidget(self.thumb)
+        dr = QHBoxLayout(); dr.setContentsMargins(10, 4, 10, 10)
         self.dur_badge = mk_lbl('—', 'durBadge')
-        dr.addStretch(); dr.addWidget(self.dur_badge); ll.addLayout(dr); ll.addStretch()
+        dr.addStretch(); dr.addWidget(self.dur_badge)
+        ll.addLayout(dr); ll.addStretch()
         cl.addWidget(left)
 
-        # Info pane
+        # Right detail column
         right = QWidget()
-        scroll_r = QScrollArea(); scroll_r.setWidgetResizable(True)
-        scroll_r.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_r.setWidget(right)
-        rl = QVBoxLayout(right); rl.setContentsMargins(24, 22, 24, 16); rl.setSpacing(0)
+        rl = QVBoxLayout(right); rl.setContentsMargins(20, 18, 20, 14); rl.setSpacing(0)
 
         self.vc_channel = mk_lbl('—', 'vcChannel'); rl.addWidget(self.vc_channel)
-        self.vc_title = mk_lbl('—', 'vcTitle'); self.vc_title.setWordWrap(True)
-        tw = QWidget(); tl_l = QHBoxLayout(tw); tl_l.setContentsMargins(0, 6, 0, 12)
+        self.vc_title   = mk_lbl('—', 'vcTitle');   self.vc_title.setWordWrap(True)
+        tw = QWidget(); tl_l = QHBoxLayout(tw); tl_l.setContentsMargins(0, 4, 0, 10)
         tl_l.addWidget(self.vc_title); rl.addWidget(tw)
 
-        # Tag row 1: views, likes, date, size, category
-        tags1 = QWidget(); t1l = QHBoxLayout(tags1); t1l.setContentsMargins(0, 0, 0, 8); t1l.setSpacing(6)
+        tags1 = QWidget(); t1l = QHBoxLayout(tags1)
+        t1l.setContentsMargins(0, 0, 0, 8); t1l.setSpacing(6)
         self.tag_views = mk_lbl('—', 'tagLabelHi')
-        self.tag_likes = mk_lbl('—', 'tagLabelG')
+        self.tag_likes = mk_lbl('—', 'tagLabel')
         self.tag_date  = mk_lbl('—', 'tagLabel')
         self.tag_size  = mk_lbl('—', 'tagLabel')
-        self.tag_cats  = mk_lbl('—', 'tagLabelY')
-        for w2 in (self.tag_views, self.tag_likes, self.tag_date, self.tag_size, self.tag_cats):
-            t1l.addWidget(w2)
+        for w in (self.tag_views, self.tag_likes, self.tag_date, self.tag_size):
+            t1l.addWidget(w)
         t1l.addStretch(); rl.addWidget(tags1)
 
-        # Info grid section
-        info_sec = QFrame(); info_sec.setObjectName('infoSection')
-        info_lay = QGridLayout(info_sec); info_lay.setContentsMargins(14, 12, 14, 12); info_lay.setSpacing(10)
-
-        def mini(label):
-            w3 = QWidget(); lv = QVBoxLayout(w3); lv.setContentsMargins(0,0,0,0); lv.setSpacing(2)
-            lv.addWidget(mk_lbl(label, 'plStatL'))
-            vl = mk_lbl('—', 'monoSmall'); lv.addWidget(vl); w3._vl = vl; return w3
-
-        self.lbl_subs     = mini('SUBSCRIBERS')
-        self.lbl_comments = mini('COMMENTS')
-        self.lbl_age      = mini('AGE RESTRICT')
-        self.lbl_lang     = mini('LANGUAGE')
-        self.lbl_res      = mini('BEST RES')
-        self.lbl_tags     = mini('TAGS')
-        self.lbl_tags._vl.setWordWrap(True)
-
-        info_lay.addWidget(self.lbl_subs,     0, 0)
-        info_lay.addWidget(self.lbl_comments, 0, 1)
-        info_lay.addWidget(self.lbl_age,      0, 2)
-        info_lay.addWidget(self.lbl_lang,     0, 3)
-        info_lay.addWidget(self.lbl_res,      1, 0)
-        info_lay.addWidget(self.lbl_tags,     1, 1, 1, 3)
-
-        rl.addWidget(info_sec)
-
-        # Description
-        desc_lbl_title = mk_lbl('DESCRIPTION', 'dlLabel')
-        desc_lbl_title.setContentsMargins(0, 12, 0, 4)
-        rl.addWidget(desc_lbl_title)
-        self.desc_lbl = QLabel('—'); self.desc_lbl.setObjectName('descLabel')
-        self.desc_lbl.setWordWrap(True); self.desc_lbl.setMaximumHeight(90)
-        rl.addWidget(self.desc_lbl)
-
         # Format pills
-        pr = QHBoxLayout(); pr.setContentsMargins(0, 14, 0, 12); pr.setSpacing(6)
+        pr = QHBoxLayout(); pr.setContentsMargins(0, 4, 0, 10); pr.setSpacing(6)
         self._pills = {}
         for key, txt in [('va', 'Video + Audio'), ('ao', 'Audio Only'), ('vo', 'Video Only')]:
             b = QPushButton(txt); b.setObjectName('fmtPill')
@@ -1217,23 +1398,24 @@ class SingleVideoPage(QWidget):
         pr.addStretch(); rl.addLayout(pr)
         rl.addWidget(sep_h())
 
-        # Download controls
+        # Download row
         dl_w = QWidget(); dl_l = QVBoxLayout(dl_w)
-        dl_l.setContentsMargins(0, 16, 0, 16); dl_l.setSpacing(14)
+        dl_l.setContentsMargins(0, 12, 0, 12); dl_l.setSpacing(12)
         row1 = QHBoxLayout(); row1.setSpacing(10)
         for ts, attr in [('QUALITY', 'vid_cb'), ('AUDIO', 'aud_cb'), ('LANGUAGE', 'lang_cb')]:
-            col = QVBoxLayout(); col.setSpacing(5); col.addWidget(mk_lbl(ts, 'dlLabel'))
-            cb  = QComboBox(); cb.setMinimumWidth(150); setattr(self, attr, cb)
+            col = QVBoxLayout(); col.setSpacing(4)
+            col.addWidget(mk_lbl(ts, 'dlLabel'))
+            cb = QComboBox(); cb.setMinimumWidth(140); setattr(self, attr, cb)
             col.addWidget(cb); row1.addLayout(col)
         row1.addStretch()
-        bc = QVBoxLayout(); bc.setSpacing(5); bc.addWidget(mk_lbl(' ', 'dlLabel'))
+        bc = QVBoxLayout(); bc.setSpacing(4); bc.addWidget(mk_lbl(' ', 'dlLabel'))
         self.dl_btn = QPushButton('↓  Download'); self.dl_btn.setObjectName('dlMainBtn')
-        self.dl_btn.setMinimumWidth(130); self.dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_btn.setMinimumWidth(120); self.dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dl_btn.clicked.connect(self._start_dl)
         bc.addWidget(self.dl_btn); row1.addLayout(bc); dl_l.addLayout(row1)
 
         self.prog_w = QWidget(); self.prog_w.setVisible(False)
-        pw_l = QVBoxLayout(self.prog_w); pw_l.setContentsMargins(0, 0, 0, 0); pw_l.setSpacing(8)
+        pw_l = QVBoxLayout(self.prog_w); pw_l.setContentsMargins(0, 0, 0, 0); pw_l.setSpacing(6)
         ir = QHBoxLayout()
         self.prog_pct = mk_lbl('0%', 'monoSmall'); self.prog_spd = mk_lbl('—', 'monoSmall')
         ir.addWidget(self.prog_pct); ir.addStretch(); ir.addWidget(self.prog_spd)
@@ -1242,107 +1424,54 @@ class SingleVideoPage(QWidget):
         self.prog_status = StatusRow(); pw_l.addWidget(self.prog_status)
         dl_l.addWidget(self.prog_w)
         rl.addWidget(dl_w); rl.addStretch()
+        cl.addWidget(right, 1)
 
-        cl.addWidget(scroll_r, 1)
-        ra_l.addWidget(self.card); root.addWidget(self.result_area); root.addStretch()
+    # ── Populate ──────────────────────────────────────────────────────────────
+
+    def _populate(self, info: dict):
+        size    = info.get('filesize') or info.get('filesize_approx')
+        channel = info.get('uploader') or info.get('channel', '')
+        self.vc_channel.setText(channel.upper())
+        self.vc_title.setText(info.get('title', ''))
+        views = info.get('view_count')
+        likes = info.get('like_count')
+        ud    = info.get('upload_date', '') or ''
+        if len(ud) == 8: ud = f"{ud[6:8]}/{ud[4:6]}/{ud[:4]}"
+        self.tag_views.setText(fmt_views(views))
+        self.tag_likes.setText(fmt_likes(likes))
+        self.tag_date.setText(f"📅 {ud}" if ud else '—')
+        self.tag_size.setText(fmt_size(size))
+        self.dur_badge.setText(fmt_dur(info.get('duration')))
+
+        turl = best_thumbnail(info)
+        if turl:
+            tw = ThumbnailFetcher(turl, 320, 215)
+            tw.ready.connect(self.thumb.set_pixmap)
+            tw.start(); self._workers['thumb'] = tw
+
+        vf, af = parse_formats(info)
+        self._vid_ids = []; self._aud_ids = []
+        self.vid_cb.clear(); self.aud_cb.clear()
+        for t, fid in vf: self.vid_cb.addItem(t); self._vid_ids.append(fid)
+        for t, fid in af: self.aud_cb.addItem(t); self._aud_ids.append(fid)
+        self.lang_cb.clear(); langs = set()
+        for f in info.get('formats', []):
+            lang = f.get('language', '')
+            if lang and lang not in langs:
+                langs.add(lang); self.lang_cb.addItem(lang.capitalize())
+        if not langs: self.lang_cb.addItem('Original')
+        self.prog_w.setVisible(False); self.prog.reset()
+        self.dl_btn.setEnabled(True); self.dl_btn.setText('↓  Download')
+        self.dl_btn.setStyleSheet('')
+
+    # ── Interaction ───────────────────────────────────────────────────────────
 
     def _set_fmt(self, key, _):
         self._active_fmt = key
         for k, b in self._pills.items():
             b.setProperty('active', k == key); b.style().unpolish(b); b.style().polish(b)
 
-    def _fetch(self, url):
-        self.search.set_loading('Connecting to YouTube…')
-        self.result_area.setVisible(False)
-        if self._hero_anim:
-            self._hero_anim.stop()
-        self._hero_anim = QPropertyAnimation(self.hero, QByteArray(b'maximumHeight'))
-        self._hero_anim.setDuration(500)
-        self._hero_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self._hero_anim.setStartValue(500)
-        self._hero_anim.setEndValue(120)
-        self._hero_anim.start()
-        print(f'[Nexus] Fetching: {url}')
-        w = VideoInfoWorker(url); w.info_ready.connect(self._on_info)
-        w.error.connect(lambda e: self.search.set_error(e[:140])); w.start()
-        self._workers['info'] = w
-
-    def _on_info(self, info):
-        self._info = info; self.search.set_done('Ready to download')
-        size    = info.get('filesize') or info.get('filesize_approx')
-        channel = info.get('uploader') or info.get('channel', '')
-        self.vc_channel.setText(channel.upper())
-        self.vc_title.setText(info.get('title', ''))
-
-        views = info.get('view_count')
-        likes = info.get('like_count')
-        comments = info.get('comment_count')
-        ud = info.get('upload_date', '') or ''
-        if len(ud) == 8: ud = f"{ud[6:8]}/{ud[4:6]}/{ud[:4]}"
-
-        self.tag_views.setText(fmt_views(views))
-        self.tag_likes.setText(fmt_likes(likes))
-        self.tag_date.setText(f"📅 {ud}" if ud else '—')
-        self.tag_size.setText(fmt_size(size))
-        cats = info.get('categories', [])
-        self.tag_cats.setText(cats[0] if cats else '—')
-
-        # Subscriber count
-        subs = info.get('channel_follower_count')
-        if subs:
-            if subs >= 1_000_000:   subs_s = f"{subs/1_000_000:.1f}M"
-            elif subs >= 1_000:     subs_s = f"{subs/1_000:.0f}K"
-            else:                   subs_s = str(subs)
-        else: subs_s = '—'
-        self.lbl_subs._vl.setText(subs_s)
-
-        # Best resolution
-        best_h = max((f.get('height') or 0 for f in info.get('formats', [])), default=0)
-        self.lbl_res._vl.setText(f"{best_h}p" if best_h else '—')
-
-        # Age restriction
-        self.lbl_age._vl.setText('Yes' if info.get('age_limit', 0) else 'No')
-
-        # Language
-        self.lbl_lang._vl.setText(info.get('language', '—') or '—')
-
-        # Comments
-        self.lbl_comments._vl.setText(fmt_views(comments).replace(' views', '') if comments else '—')
-
-        # Duration
-        self.dur_badge.setText(fmt_dur(info.get('duration')))
-
-        # Tags
-        tags = info.get('tags', []) or []
-        tags_str = '  ·  '.join(tags[:5]) if tags else 'None'
-        self.lbl_tags._vl.setText(tags_str[:60])
-
-        # Description
-        desc = (info.get('description', '') or '').strip()
-        desc_short = ' '.join(desc[:280].split())
-        self.desc_lbl.setText((desc_short + '…') if len(desc) > 280 else (desc_short or 'No description available.'))
-
-        turl = best_thumbnail(info)
-        if turl:
-            tw = ThumbnailFetcher(turl, 340, 226); tw.ready.connect(self.thumb.set_pixmap)
-            tw.start(); self._workers['thumb'] = tw
-
-        vf, af = parse_formats(info)
-        self._vid_ids = []; self._aud_ids = []; self.vid_cb.clear(); self.aud_cb.clear()
-        for t, fid in vf: self.vid_cb.addItem(t); self._vid_ids.append(fid)
-        for t, fid in af: self.aud_cb.addItem(t); self._aud_ids.append(fid)
-        self.lang_cb.clear(); langs = set()
-        for f in info.get('formats', []):
-            lang = f.get('language', '')
-            if lang and lang not in langs: langs.add(lang); self.lang_cb.addItem(lang.capitalize())
-        if not langs: self.lang_cb.addItem('Original')
-        self.prog_w.setVisible(False); self.prog.reset()
-        self.dl_btn.setEnabled(True); self.dl_btn.setText('↓  Download')
-        self.dl_btn.setStyleSheet(''); self.result_area.setVisible(True)
-
-
     def _start_dl(self):
-        if not self._info: return
         out = QFileDialog.getExistingDirectory(self, 'Select Folder', str(Path.home() / 'Downloads'))
         if not out: return
         vi = self.vid_cb.currentIndex(); ai = self.aud_cb.currentIndex()
@@ -1351,7 +1480,7 @@ class SingleVideoPage(QWidget):
         if   self._active_fmt == 'va': fmt = f"{vf}+{af}/best"
         elif self._active_fmt == 'ao': fmt = af
         else:                           fmt = vf
-        url = self._info.get('webpage_url', '') or self.search.url()
+        url = self._info.get('webpage_url', '')
         self.prog.reset(); self.prog_w.setVisible(True)
         self.dl_btn.setEnabled(False); self.dl_btn.setText('Downloading…')
         self.prog_status.show_loading('Starting…')
@@ -1359,9 +1488,11 @@ class SingleVideoPage(QWidget):
         w.progress.connect(self._on_prog); w.finished.connect(self._on_done)
         w.error.connect(self._on_err); w.start(); self._workers['dl'] = w
 
-    def _on_prog(self, pct, spd):
-        self.prog.setValue(pct); self.prog_pct.setText(f"{pct:.1f}%")
-        self.prog_spd.setText(spd); self.prog_status.show_info(f"Downloading… {pct:.1f}%  ·  {spd}")
+    def _on_prog(self, pct, label):
+        self.prog.setValue(pct)
+        self.prog_pct.setText(f"{pct:.1f}%")
+        self.prog_spd.setText(label)
+        self.prog_status.show_info(f"{pct:.1f}%  ·  {label}")
 
     def _on_done(self, fname):
         self.prog.setValue(100); self.prog_pct.setText('100%'); self.prog_spd.setText('')
@@ -1382,7 +1513,146 @@ class SingleVideoPage(QWidget):
 
     def _on_err(self, msg):
         self.prog_status.show_err(msg[:140])
-        self.dl_btn.setEnabled(True); self.dl_btn.setText('↓  Retry'); self.dl_btn.setStyleSheet('')
+        self.dl_btn.setEnabled(True); self.dl_btn.setText('↓  Retry')
+        self.dl_btn.setStyleSheet('')
+
+
+# ────────────────────── Single video page ───────────────────────────────────
+#
+#  Key change: the search bar STAYS at the top always.
+#  Each new fetch APPENDS a VideoResultCard below.
+#  A "Clear all" button lets the user remove all fetched cards.
+#
+
+class SingleVideoPage(QWidget):
+    download_saved = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._workers = {}
+        self._cards: list[VideoResultCard] = []
+        self._build()
+
+    def _build(self):
+        # Outer scroll area
+        scroll = QScrollArea(self); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+        self._container = QWidget(); scroll.setWidget(self._container)
+        self._root = QVBoxLayout(self._container)
+        self._root.setContentsMargins(0, 0, 0, 0); self._root.setSpacing(0)
+
+        # ── Persistent hero / search area (always visible) ────────────────────
+        hero = QWidget()
+        hl = QVBoxLayout(hero); hl.setContentsMargins(24, 60, 24, 36); hl.setSpacing(0)
+        hl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        badge = HeroBadge('YouTube Media Suite'); badge.setFixedWidth(210)
+        bw = QWidget(); bwl = QHBoxLayout(bw)
+        bwl.setContentsMargins(0, 0, 0, 22)
+        bwl.addStretch(); bwl.addWidget(badge); bwl.addStretch()
+        hl.addWidget(bw)
+
+        title = QLabel('Download anything.\nInstantly.')
+        title.setObjectName('heroTitle')
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter); title.setWordWrap(True)
+        hl.addWidget(title)
+
+        sub = QLabel('Paste any YouTube URL below — stack multiple videos!')
+        sub.setObjectName('heroSub'); sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sw = QWidget(); swl = QHBoxLayout(sw); swl.setContentsMargins(0, 10, 0, 32)
+        swl.addStretch(); swl.addWidget(sub); swl.addStretch(); hl.addWidget(sw)
+
+        # Search bar row
+        sbw = QWidget(); sbl = QHBoxLayout(sbw); sbl.setContentsMargins(0, 0, 0, 0)
+        self.search = SearchBar('🔗', 'Paste a YouTube link…')
+        self.search.setMaximumWidth(700)
+        self.search.submitted.connect(self._fetch)
+        sbl.addStretch(); sbl.addWidget(self.search, 0); sbl.addStretch()
+        hl.addWidget(sbw)
+
+        self._root.addWidget(hero)
+
+        # ── Toolbar row (Clear all button) ────────────────────────────────────
+        self._toolbar = QWidget(); self._toolbar.setVisible(False)
+        tb_l = QHBoxLayout(self._toolbar)
+        tb_l.setContentsMargins(24, 0, 24, 12); tb_l.setSpacing(8)
+        self._count_lbl = mk_lbl('', 'monoSmall')
+        tb_l.addWidget(self._count_lbl); tb_l.addStretch()
+        clr_btn = QPushButton('✕  Clear all'); clr_btn.setObjectName('clearHistBtn')
+        clr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clr_btn.clicked.connect(self._clear_cards)
+        tb_l.addWidget(clr_btn)
+        self._root.addWidget(self._toolbar)
+
+        # ── Cards container ───────────────────────────────────────────────────
+        self._cards_w = QWidget()
+        self._cards_l = QVBoxLayout(self._cards_w)
+        self._cards_l.setContentsMargins(24, 0, 24, 60); self._cards_l.setSpacing(20)
+        self._root.addWidget(self._cards_w)
+        self._root.addStretch()
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+
+    def _fetch(self, url: str):
+        clean = normalize_video_url(url)
+        if clean != url:
+            print(f'[Nexus] URL normalised → {clean}')
+        self.search.set_loading('Connecting to YouTube…')
+        print(f'[Nexus] Fetching: {clean}')
+        w = VideoInfoWorker(clean)
+        w.info_ready.connect(self._on_info)
+        w.error.connect(lambda e: self.search.set_error(e[:140]))
+        w.start()
+        # keep a reference
+        self._workers[f'info_{id(w)}'] = w
+
+    def _on_info(self, info: dict):
+        self.search.set_done(f'Ready — {len(self._cards) + 1} video(s) loaded')
+        card = VideoResultCard(info)
+        card.download_saved.connect(self.download_saved)
+        self._cards.append(card)
+        self._cards_l.addWidget(card)
+        self._toolbar.setVisible(True)
+        n = len(self._cards)
+        self._count_lbl.setText(f"{n} video{'s' if n != 1 else ''} fetched")
+
+        # Smooth reveal animation
+        anim = QPropertyAnimation(card, QByteArray(b'maximumHeight'))
+        anim.setDuration(350)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(0)
+        anim.setEndValue(500)
+        anim.start()
+        # keep reference so GC doesn't kill it
+        self._workers[f'anim_{id(card)}'] = anim
+
+    def _clear_cards(self):
+        for card in self._cards:
+            card.deleteLater()
+        self._cards.clear()
+        self._toolbar.setVisible(False)
+        self.search.set_info('')
+        self.search.status.setVisible(False)
+
+
+# ────────────────────── Playlist page ───────────────────────────────────────
+
+class ClickableRow(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('plRow')
+        self._chk: QCheckBox | None = None
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton and self._chk is not None:
+            child = self.childAt(event.pos())
+            interactive = (QPushButton, QComboBox, QCheckBox, QScrollBar, QAbstractSlider)
+            if child is None or not isinstance(child, interactive):
+                self._chk.toggle()
+        super().mousePressEvent(event)
 
 
 class PlaylistPage(QWidget):
@@ -1390,15 +1660,15 @@ class PlaylistPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._items           = []
-        self._workers         = {}
-        self._done            = 0
-        self._loaded          = 0
-        self._queue           = []
-        self._current_worker  = None
-        self._is_downloading  = False
-        self._overall_total   = 0
-        self._overall_done    = 0
+        self._items          = []
+        self._workers        = {}
+        self._done           = 0
+        self._loaded         = 0
+        self._queue          = []
+        self._current_worker = None
+        self._is_downloading = False
+        self._overall_total  = 0
+        self._overall_done   = 0
         self._build()
 
     def _build(self):
@@ -1421,11 +1691,9 @@ class PlaylistPage(QWidget):
         bl.addStretch(); bl.addWidget(self.search, 0); bl.addStretch(); hl.addWidget(bw)
         root.addWidget(hero)
 
-        # Stats + controls bar
         self.stats_bar = QWidget(); self.stats_bar.setVisible(False)
         sb_l = QHBoxLayout(self.stats_bar)
         sb_l.setContentsMargins(24, 0, 24, 14); sb_l.setSpacing(10)
-
         self.st_total  = self._mk_stat('0', 'Total',    'plStatNA')
         self.st_loaded = self._mk_stat('0', 'Loaded',   'plStatN')
         self.st_sel    = self._mk_stat('0', 'Selected', 'plStatN')
@@ -1433,7 +1701,6 @@ class PlaylistPage(QWidget):
         for sc in (self.st_total, self.st_loaded, self.st_sel, self.st_done):
             sb_l.addWidget(sc)
         sb_l.addStretch()
-
         qc = QVBoxLayout(); qc.setSpacing(4)
         qc.addWidget(mk_lbl('QUALITY', 'dlLabel'))
         self.batch_q = QComboBox(); self.batch_q.setMinimumWidth(144)
@@ -1441,7 +1708,6 @@ class PlaylistPage(QWidget):
         qc.addWidget(self.batch_q)
         qcw = QWidget(); qcwl = QVBoxLayout(qcw); qcwl.setContentsMargins(0,0,0,0)
         qcwl.addLayout(qc); sb_l.addWidget(qcw)
-
         btn_col = QVBoxLayout(); btn_col.setSpacing(6)
         btn_col.addWidget(mk_lbl(' ', 'dlLabel'))
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
@@ -1455,19 +1721,16 @@ class PlaylistPage(QWidget):
         btn_row.addWidget(self.dl_sel_btn)
         self.stop_btn = QPushButton('■  Stop'); self.stop_btn.setObjectName('stopBtn')
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.stop_btn.clicked.connect(self._stop_all)
-        self.stop_btn.setVisible(False)
+        self.stop_btn.clicked.connect(self._stop_all); self.stop_btn.setVisible(False)
         btn_row.addWidget(self.stop_btn)
         btn_col.addLayout(btn_row)
         btn_col_w = QWidget(); btn_col_wl = QVBoxLayout(btn_col_w); btn_col_wl.setContentsMargins(0,0,0,0)
         btn_col_wl.addLayout(btn_col); sb_l.addWidget(btn_col_w)
         root.addWidget(self.stats_bar)
 
-        # Dual progress panel
         self.prog_panel = QWidget(); self.prog_panel.setVisible(False)
         pp_l = QVBoxLayout(self.prog_panel)
         pp_l.setContentsMargins(24, 0, 24, 16); pp_l.setSpacing(10)
-
         cur_frame = QFrame(); cur_frame.setObjectName('infoSection')
         cur_lay = QVBoxLayout(cur_frame); cur_lay.setContentsMargins(16, 12, 16, 12); cur_lay.setSpacing(6)
         row_c = QHBoxLayout()
@@ -1481,7 +1744,6 @@ class PlaylistPage(QWidget):
         self.curr_title = mk_lbl('—', 'plRowMeta'); self.curr_title.setWordWrap(True)
         cur_lay.addWidget(self.curr_title)
         pp_l.addWidget(cur_frame)
-
         ovr_frame = QFrame(); ovr_frame.setObjectName('infoSection')
         ovr_lay = QVBoxLayout(ovr_frame); ovr_lay.setContentsMargins(16, 12, 16, 12); ovr_lay.setSpacing(6)
         row_o = QHBoxLayout()
@@ -1494,7 +1756,6 @@ class PlaylistPage(QWidget):
         pp_l.addWidget(ovr_frame)
         root.addWidget(self.prog_panel)
 
-        # Video grid
         self.grid_w = QWidget(); self.grid_l = QVBoxLayout(self.grid_w)
         self.grid_l.setContentsMargins(24, 0, 24, 60); self.grid_l.setSpacing(8)
         self.grid_l.addStretch()
@@ -1536,27 +1797,22 @@ class PlaylistPage(QWidget):
         self.search.set_done(f'{self._loaded} videos loaded')
 
     def _make_row(self, idx, info):
-        row = QFrame(); row.setObjectName('plRow')
-        rl  = QHBoxLayout(row); rl.setContentsMargins(12, 12, 12, 12); rl.setSpacing(10)
-
-        # Checkbox — checked by default
+        row = ClickableRow()
+        rl  = QHBoxLayout(row); rl.setContentsMargins(12, 12, 12, 12); rl.setSpacing(12)
         chk = QCheckBox(); chk.setChecked(True)
+        chk.setFixedSize(32, 32)
         chk.stateChanged.connect(self._update_sel_count)
-        row._chk = chk; rl.addWidget(chk)
-
-        # Index number
+        row._chk = chk
+        rl.addWidget(chk, 0, Qt.AlignmentFlag.AlignVCenter)
         il = mk_lbl(f"{idx+1:02d}", 'monoSmall')
-        il.setFixedWidth(22); il.setAlignment(Qt.AlignmentFlag.AlignCenter); rl.addWidget(il)
-
-        # Thumbnail
+        il.setFixedWidth(22); il.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl.addWidget(il, 0, Qt.AlignmentFlag.AlignVCenter)
         th = ThumbWidget(144, 81)
         turl = best_thumbnail(info)
         if turl:
             tw = ThumbnailFetcher(turl, 144, 81); tw.ready.connect(th.set_pixmap)
             tw.start(); row._tw = tw
         rl.addWidget(th)
-
-        # Info column
         ic = QVBoxLayout(); ic.setSpacing(4)
         title   = info.get('title', 'Unknown')
         channel = info.get('uploader') or info.get('channel', '') or '—'
@@ -1566,7 +1822,6 @@ class PlaylistPage(QWidget):
         sz      = fmt_size(info.get('filesize') or info.get('filesize_approx'))
         ud      = info.get('upload_date', '') or ''
         if len(ud) == 8: ud = f"{ud[6:8]}/{ud[4:6]}/{ud[:4]}"
-
         tl   = mk_lbl(title[:85] + ('…' if len(title) > 85 else ''), 'plRowTitle')
         meta = mk_lbl(
             f"📺 {channel}  ·  ⏱ {dur}  ·  👁 {views}  ·  👍 {likes}  ·  💾 {sz}  ·  📅 {ud}",
@@ -1577,8 +1832,6 @@ class PlaylistPage(QWidget):
         ic.addWidget(tl); ic.addWidget(meta)
         ic.addWidget(row._status_lbl); ic.addWidget(row._prog)
         rl.addLayout(ic, 1)
-
-        # Per-row quality selectors + individual download button
         act = QVBoxLayout(); act.setSpacing(6)
         act.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         vf, af = parse_formats(info)
@@ -1590,13 +1843,11 @@ class PlaylistPage(QWidget):
         for t, _ in af: ac.addItem(t)
         act.addWidget(vc); act.addWidget(ac)
         row._vc = vc; row._ac = ac
-
         db = QPushButton('↓  Download'); db.setObjectName('plDlBtn')
         db.setCursor(Qt.CursorShape.PointingHandCursor)
         db.clicked.connect(partial(self._dl_one_now, row))
         row._btn = db; act.addWidget(db)
         rl.addLayout(act)
-
         row._info = info; return row
 
     def _update_sel_count(self):
@@ -1609,8 +1860,6 @@ class PlaylistPage(QWidget):
             r._chk.setChecked(not all_checked)
         self.sel_all_btn.setText('Deselect All' if not all_checked else 'Select All')
 
-    # ── Single-video download (per-row button) ────────────────────────────────
-
     def _dl_one_now(self, row):
         out = QFileDialog.getExistingDirectory(self, 'Select Folder', str(Path.home() / 'Downloads'))
         if not out: return
@@ -1621,9 +1870,9 @@ class PlaylistPage(QWidget):
         row._btn.setEnabled(False); row._btn.setText('Downloading…'); row._prog.reset()
         row._status_lbl.setText('')
         w = DownloadWorker(url, fmt, out)
-        w.progress.connect(lambda pct, spd, r=row: (
+        w.progress.connect(lambda pct, lbl, r=row: (
             r._prog.setValue(pct),
-            r._status_lbl.setText(f"{pct:.1f}%  ·  {spd}")
+            r._status_lbl.setText(f"{pct:.1f}%  ·  {lbl}")
         ))
         w.finished.connect(lambda f, r=row, i=row._info: self._mark_done_single(r, f, i))
         w.error.connect(lambda e, r=row: self._mark_err(r, e))
@@ -1647,14 +1896,12 @@ class PlaylistPage(QWidget):
         row._status_lbl.setText(f"✗ {msg[:50]}")
         self.search.set_error(msg[:80])
 
-    # ── Batch "Download Selected" ─────────────────────────────────────────────
-
     def _dl_selected(self):
         out = QFileDialog.getExistingDirectory(self, 'Select Folder', str(Path.home() / 'Downloads'))
         if not out: return
         qi   = self.batch_q.currentIndex()
         vmap = {0: 'bestvideo', 1: 'bestvideo[height<=1080]', 2: 'bestvideo[height<=720]',
-                3: 'bestvideo[height<=480]',  4: 'bestvideo[height<=360]'}
+                3: 'bestvideo[height<=480]', 4: 'bestvideo[height<=360]'}
         fmt  = f"{vmap.get(qi, 'bestvideo')}+bestaudio/best"
         queue = []
         for row in self._items:
@@ -1685,17 +1932,15 @@ class PlaylistPage(QWidget):
         self.curr_pct.setText('0%'); self.curr_spd.setText('—')
         self.curr_title.setText(row._info.get('title', '')[:80])
         w = DownloadWorker(url, fmt, out)
-        w.progress.connect(lambda pct, spd, r=row: self._on_curr_prog(pct, spd, r))
+        w.progress.connect(lambda pct, lbl, r=row: self._on_curr_prog(pct, lbl, r))
         w.finished.connect(lambda f, r=row, i=row._info: self._on_curr_done(r, f, i))
         w.error.connect(lambda e, r=row: self._on_curr_err(r, e))
         w.start(); self._current_worker = w
 
-    def _on_curr_prog(self, pct, spd, row):
-        self.curr_prog.setValue(pct)
-        self.curr_pct.setText(f"{pct:.1f}%")
-        self.curr_spd.setText(spd)
-        row._prog.setValue(pct)
-        row._status_lbl.setText(f"{pct:.1f}%  ·  {spd}")
+    def _on_curr_prog(self, pct, lbl, row):
+        self.curr_prog.setValue(pct); self.curr_pct.setText(f"{pct:.1f}%")
+        self.curr_spd.setText(lbl); row._prog.setValue(pct)
+        row._status_lbl.setText(f"{pct:.1f}%  ·  {lbl}")
 
     def _on_curr_done(self, row, fname, info):
         row._prog.setValue(100); row._btn.setText('✓  Done')
@@ -1725,23 +1970,20 @@ class PlaylistPage(QWidget):
         self._next_in_queue()
 
     def _stop_all(self):
-        self._is_downloading = False
-        self._queue.clear()
+        self._is_downloading = False; self._queue.clear()
         if self._current_worker:
             try: self._current_worker.abort()
             except: pass
-        self._finish_batch()
-        self.search.set_info('Download stopped.')
+        self._finish_batch(); self.search.set_info('Download stopped.')
 
     def _finish_batch(self):
-        self._is_downloading = False
-        self.stop_btn.setVisible(False)
+        self._is_downloading = False; self.stop_btn.setVisible(False)
         self.dl_sel_btn.setEnabled(True)
         if self._overall_total > 0 and self._overall_done == self._overall_total:
             self.search.set_done(f'All {self._overall_total} videos downloaded.')
 
 
-
+# ────────────────────── Thumbnail page ──────────────────────────────────────
 
 class ThumbnailPage(QWidget):
     def __init__(self, parent=None):
@@ -1787,8 +2029,9 @@ class ThumbnailPage(QWidget):
         tc.addWidget(ir); rwl.addStretch(); rwl.addWidget(self.tb_card, 0); rwl.addStretch()
         root.addWidget(rw); root.addStretch()
     def _fetch(self, url):
+        clean_url = normalize_video_url(url)
         self.search.set_loading('Fetching thumbnail…'); self.tb_card.setVisible(False)
-        w = VideoInfoWorker(url); w.info_ready.connect(self._on_info)
+        w = VideoInfoWorker(clean_url); w.info_ready.connect(self._on_info)
         w.error.connect(lambda e: self.search.set_error(e[:140])); w.start(); self._workers['info'] = w
     def _on_info(self, info):
         self._info = info; self.search.set_done('Thumbnail ready')
@@ -1818,6 +2061,8 @@ class ThumbnailPage(QWidget):
                 self.search.set_error(str(e)[:100])
         threading.Thread(target=_save, daemon=True).start()
 
+
+# ────────────────────── History page ────────────────────────────────────────
 
 class HistoryPage(QWidget):
     def __init__(self, parent=None):
@@ -1889,6 +2134,8 @@ class HistoryPage(QWidget):
             print('[Nexus] History cleared')
 
 
+# ────────────────────── Console panel ───────────────────────────────────────
+
 class ConsolePanel(QWidget):
     close_clicked = pyqtSignal()
     def __init__(self, parent=None):
@@ -1924,18 +2171,28 @@ class ConsolePanel(QWidget):
         c.insertText(t, fmt); self.te.ensureCursorVisible()
 
 
+# ────────────────────── Settings panel ──────────────────────────────────────
+
 class SettingsPanel(QWidget):
-    close_clicked   = pyqtSignal()
-    nav_pos_changed = pyqtSignal(str)
-    bg_anim_changed = pyqtSignal(bool)
+    close_clicked    = pyqtSignal()
+    nav_pos_changed  = pyqtSignal(str)
+    bg_anim_changed  = pyqtSignal(bool)
+    cursor_color_changed     = pyqtSignal(str)
+    top_glow_color_changed   = pyqtSignal(str)
+    corner_glow_color_changed= pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('slidePanel')
         d = load_data()
-        self._pending    = d.get('nav_position', 'top')
-        self._bg_enabled = d.get('bg_animate', True)
+        self._pending          = d.get('nav_position', 'top')
+        self._bg_enabled       = d.get('bg_animate', True)
+        self._cursor_color     = d.get('cursor_color', '#3b82f6')
+        self._top_glow_color   = d.get('top_glow_color', '#3b82f6')
+        self._corner_glow_color= d.get('corner_glow_color', '#7c3aed')
+
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+
         hdr = QWidget(); hdr.setObjectName('panelHeader')
         hl  = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 12, 0); hl.setSpacing(8)
         dot = BreatheDot(C['accent'], 6); title = mk_lbl('SETTINGS', 'panelSub')
@@ -1944,10 +2201,14 @@ class SettingsPanel(QWidget):
         x.setCursor(Qt.CursorShape.PointingHandCursor)
         x.clicked.connect(self.close_clicked.emit); hl.addWidget(x)
         lay.addWidget(hdr)
-        body = QWidget(); bl = QVBoxLayout(body)
-        bl.setContentsMargins(24, 32, 24, 32); bl.setSpacing(28)
 
-        sec1 = mk_lbl('NAV BAR POSITION', 'panelSub'); bl.addWidget(sec1)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget(); bl = QVBoxLayout(body)
+        bl.setContentsMargins(24, 28, 24, 28); bl.setSpacing(22)
+        scroll.setWidget(body)
+
+        bl.addWidget(mk_lbl('NAV BAR POSITION', 'panelSub'))
         br = QHBoxLayout(); br.setSpacing(12)
         self.btn_top = QPushButton('⬆  Top'); self.btn_top.setObjectName('posBtnTop')
         self.btn_top.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1956,13 +2217,10 @@ class SettingsPanel(QWidget):
         self.btn_bot.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_bot.clicked.connect(lambda: self._pick('bottom'))
         br.addWidget(self.btn_top); br.addWidget(self.btn_bot); bl.addLayout(br)
-        hint = mk_lbl('Tab bar moves to top or bottom of the window.', 'monoSmall', wrap=True)
-        bl.addWidget(hint)
+        bl.addWidget(mk_lbl('Tab bar moves to top or bottom of the window.', 'monoSmall', wrap=True))
+        bl.addWidget(self._div())
 
-        div1 = QFrame(); div1.setFrameShape(QFrame.Shape.HLine)
-        div1.setStyleSheet(f"background:{C['border']};max-height:1px;border:none;"); bl.addWidget(div1)
-
-        sec2 = mk_lbl('BACKGROUND ANIMATION', 'panelSub'); bl.addWidget(sec2)
+        bl.addWidget(mk_lbl('BACKGROUND ANIMATION', 'panelSub'))
         bg_row = QHBoxLayout(); bg_row.setSpacing(12)
         bg_desc = mk_lbl('Moving squares in background', 'statusInfo')
         bg_row.addWidget(bg_desc, 1)
@@ -1972,21 +2230,52 @@ class SettingsPanel(QWidget):
         self.bg_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bg_toggle.clicked.connect(self._toggle_bg)
         bg_row.addWidget(self.bg_toggle); bl.addLayout(bg_row)
-        bg_hint = mk_lbl('Disable for better performance on slower systems.', 'monoSmall', wrap=True)
-        bl.addWidget(bg_hint)
+        bl.addWidget(mk_lbl('Disable for better performance on slower systems.', 'monoSmall', wrap=True))
+        bl.addWidget(self._div())
 
-        div2 = QFrame(); div2.setFrameShape(QFrame.Shape.HLine)
-        div2.setStyleSheet(f"background:{C['border']};max-height:1px;border:none;"); bl.addWidget(div2)
+        bl.addWidget(mk_lbl('CURSOR & CLICK GLOW', 'panelSub'))
+        cg_row = QHBoxLayout(); cg_row.setSpacing(10)
+        cg_row.addWidget(mk_lbl('Glow colour', 'statusInfo'), 1)
+        self.cursor_btn = ColorPickerBtn(self._cursor_color)
+        self.cursor_btn.color_changed.connect(self._on_cursor_color)
+        cg_row.addWidget(self.cursor_btn); bl.addLayout(cg_row)
+        bl.addWidget(mk_lbl(
+            'Sets the colour of the radial glow that follows your cursor\nand flashes when you click.',
+            'monoSmall', wrap=True))
+        bl.addWidget(self._div())
 
-        self.save_btn = QPushButton('  Save Settings  ↓'); self.save_btn.setObjectName('saveSettingsBtn')
+        bl.addWidget(mk_lbl('BACKGROUND GLOW', 'panelSub'))
+        tg_row = QHBoxLayout(); tg_row.setSpacing(10)
+        tg_row.addWidget(mk_lbl('Top glow colour', 'statusInfo'), 1)
+        self.top_glow_btn = ColorPickerBtn(self._top_glow_color)
+        self.top_glow_btn.color_changed.connect(self._on_top_glow)
+        tg_row.addWidget(self.top_glow_btn); bl.addLayout(tg_row)
+        cng_row = QHBoxLayout(); cng_row.setSpacing(10)
+        cng_row.addWidget(mk_lbl('Corner glow colour', 'statusInfo'), 1)
+        self.corner_glow_btn = ColorPickerBtn(self._corner_glow_color)
+        self.corner_glow_btn.color_changed.connect(self._on_corner_glow)
+        cng_row.addWidget(self.corner_glow_btn); bl.addLayout(cng_row)
+        bl.addWidget(mk_lbl(
+            'Top glow radiates from the top-centre of the window.\nCorner glow radiates from the bottom-right corner.',
+            'monoSmall', wrap=True))
+        bl.addWidget(self._div())
+
+        self.save_btn = QPushButton('  Save Settings  ↓')
+        self.save_btn.setObjectName('saveSettingsBtn')
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self._save)
         sr = QHBoxLayout(); sr.addStretch(); sr.addWidget(self.save_btn); sr.addStretch()
-        bl.addLayout(sr); bl.addStretch(); lay.addWidget(body, 1)
-        self._refresh()
+        bl.addLayout(sr); bl.addStretch()
+        lay.addWidget(scroll, 1)
+        self._refresh_nav()
+
+    def _div(self):
+        f = QFrame(); f.setFrameShape(QFrame.Shape.HLine)
+        f.setStyleSheet(f"background:{C['border']};max-height:1px;border:none;")
+        return f
 
     def _pick(self, pos):
-        self._pending = pos; self._refresh()
+        self._pending = pos; self._refresh_nav()
 
     def _toggle_bg(self):
         self._bg_enabled = not self._bg_enabled
@@ -1996,7 +2285,16 @@ class SettingsPanel(QWidget):
         self.bg_toggle.style().polish(self.bg_toggle)
         self.bg_anim_changed.emit(self._bg_enabled)
 
-    def _refresh(self):
+    def _on_cursor_color(self, color: str):
+        self._cursor_color = color; self.cursor_color_changed.emit(color)
+
+    def _on_top_glow(self, color: str):
+        self._top_glow_color = color; self.top_glow_color_changed.emit(color)
+
+    def _on_corner_glow(self, color: str):
+        self._corner_glow_color = color; self.corner_glow_color_changed.emit(color)
+
+    def _refresh_nav(self):
         self.btn_top.setProperty('active', self._pending == 'top')
         self.btn_top.style().unpolish(self.btn_top); self.btn_top.style().polish(self.btn_top)
         self.btn_bot.setProperty('active', self._pending == 'bottom')
@@ -2004,16 +2302,19 @@ class SettingsPanel(QWidget):
 
     def _save(self):
         d = load_data()
-        d['nav_position'] = self._pending
-        d['bg_animate']   = self._bg_enabled
+        d['nav_position']       = self._pending
+        d['bg_animate']         = self._bg_enabled
+        d['cursor_color']       = self._cursor_color
+        d['top_glow_color']     = self._top_glow_color
+        d['corner_glow_color']  = self._corner_glow_color
         save_data(d)
-        print(f'[Nexus] Settings saved → nav_position={self._pending}, bg_animate={self._bg_enabled}')
+        print(f'[Nexus] Settings saved → nav={self._pending}')
         self.nav_pos_changed.emit(self._pending)
         self.save_btn.setText('✓  Saved!')
         QTimer.singleShot(1600, lambda: self.save_btn.setText('  Save Settings  ↓'))
 
     def sync_pos(self, pos):
-        self._pending = pos; self._refresh()
+        self._pending = pos; self._refresh_nav()
 
     def sync_bg(self, val: bool):
         self._bg_enabled = val
@@ -2022,6 +2323,17 @@ class SettingsPanel(QWidget):
         self.bg_toggle.style().unpolish(self.bg_toggle)
         self.bg_toggle.style().polish(self.bg_toggle)
 
+    def sync_cursor_color(self, color: str):
+        self._cursor_color = color; self.cursor_btn.set_color(color)
+
+    def sync_top_glow(self, color: str):
+        self._top_glow_color = color; self.top_glow_btn.set_color(color)
+
+    def sync_corner_glow(self, color: str):
+        self._corner_glow_color = color; self.corner_glow_btn.set_color(color)
+
+
+# ────────────────────── Logo bar ────────────────────────────────────────────
 
 class LogoBar(QWidget):
     def __init__(self, parent=None):
@@ -2031,8 +2343,10 @@ class LogoBar(QWidget):
         dot  = BreatheDot(C['accent'], 8)
         logo = QLabel('Nexus'); logo.setObjectName('logoLabel')
         lay.addWidget(dot); lay.addSpacing(8); lay.addWidget(logo); lay.addStretch()
-        ver = QLabel('v7.0'); ver.setObjectName('versionLabel'); lay.addWidget(ver)
+        ver = QLabel('v7.3'); ver.setObjectName('versionLabel'); lay.addWidget(ver)
 
+
+# ────────────────────── Tab navigation ──────────────────────────────────────
 
 class TabNav(QWidget):
     tab_changed     = pyqtSignal(int)
@@ -2051,28 +2365,18 @@ class TabNav(QWidget):
         self._build()
 
     def _build(self):
-        # Root layout: [util_left] [stretch] [center_tabs] [stretch] [spacer_right]
-        # The spacer_right mirrors the width of util_left so tabs stay truly centred.
         root = QHBoxLayout(self)
-        root.setContentsMargins(16, 0, 16, 0)
-        root.setSpacing(0)
-
-        # Left: Settings + Console buttons
+        root.setContentsMargins(16, 0, 16, 0); root.setSpacing(0)
         self._sbtn = QPushButton('⚙  Settings'); self._sbtn.setObjectName('utilBtn')
         self._sbtn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sbtn.clicked.connect(self._tog_set)
         self._cbtn = QPushButton('>_  Console'); self._cbtn.setObjectName('utilBtn')
         self._cbtn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cbtn.clicked.connect(self._tog_con)
-
         left_w = QWidget(); left_l = QHBoxLayout(left_w)
         left_l.setContentsMargins(0, 0, 0, 0); left_l.setSpacing(8)
         left_l.addWidget(self._sbtn); left_l.addWidget(self._cbtn)
-        root.addWidget(left_w)
-
-        root.addStretch(1)
-
-        # Centre: tab pills
+        root.addWidget(left_w); root.addStretch(1)
         tc = QWidget(); tc.setObjectName('tabsContainer')
         tbl = QHBoxLayout(tc); tbl.setContentsMargins(4, 4, 4, 4); tbl.setSpacing(2)
         for name, idx in self.TABS:
@@ -2083,23 +2387,16 @@ class TabNav(QWidget):
         hb.setProperty('active', False); hb.setCursor(Qt.CursorShape.PointingHandCursor)
         hb.clicked.connect(self._on_hist); tbl.addWidget(hb)
         self._btns.append(hb); self._hbtn = hb
-        root.addWidget(tc)
-
-        root.addStretch(1)
-
-        # Right spacer mirrors left widget width so tabs are truly centred
-        self._right_spacer = QWidget()
-        root.addWidget(self._right_spacer)
+        root.addWidget(tc); root.addStretch(1)
+        self._right_spacer = QWidget(); root.addWidget(self._right_spacer)
 
     def _sync_spacer(self):
-        # Call after show to match spacer to left_w width
         left_w = self._sbtn.parentWidget()
         if left_w:
             self._right_spacer.setFixedWidth(left_w.sizeHint().width())
 
     def showEvent(self, e):
-        super().showEvent(e)
-        self._sync_spacer()
+        super().showEvent(e); self._sync_spacer()
 
     def _sel(self, idx):
         for i, b in enumerate(self._btns):
@@ -2143,6 +2440,8 @@ class TabNav(QWidget):
         self.style().unpolish(self); self.style().polish(self)
 
 
+# ────────────────────── Main window ─────────────────────────────────────────
+
 class NexusApp(QMainWindow):
     LOGO_H  = 46
     NAV_H   = 58
@@ -2150,7 +2449,7 @@ class NexusApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Nexus — YouTube Media Suite v7.0')
+        self.setWindowTitle('Nexus — YouTube Media Suite v7.3')
         self.setMinimumSize(1080, 700); self.resize(1300, 840)
         self._nav_pos  = 'top'
         self._con_open = False
@@ -2166,9 +2465,12 @@ class NexusApp(QMainWindow):
     def _build(self):
         central = QWidget(); self.setCentralWidget(central)
         central.setMouseTracking(True)
-
-        self.bg_canvas = AnimatedSquaresBg(central)
-
+        d = load_data()
+        self.bg_canvas = AnimatedSquaresBg(
+            central,
+            top_glow_color    = d.get('top_glow_color',    '#3b82f6'),
+            corner_glow_color = d.get('corner_glow_color', '#7c3aed'),
+        )
         self.stack = QStackedWidget(central); self.stack.setStyleSheet('background:transparent;')
         self.p_video    = SingleVideoPage()
         self.p_playlist = PlaylistPage()
@@ -2176,76 +2478,75 @@ class NexusApp(QMainWindow):
         self.p_history  = HistoryPage()
         for p in (self.p_video, self.p_playlist, self.p_thumb, self.p_history):
             self.stack.addWidget(p)
-
         self.logo_bar = LogoBar(central)
-
         self.tab_nav = TabNav(central)
         self.tab_nav.tab_changed.connect(self.stack.setCurrentIndex)
         self.tab_nav.history_clicked.connect(lambda: self.stack.setCurrentIndex(3))
         self.tab_nav.console_toggle.connect(self._on_con_toggle)
         self.tab_nav.settings_toggle.connect(self._on_set_toggle)
-
         self.con_panel = ConsolePanel(central)
         self.set_panel = SettingsPanel(central)
         self.con_panel.close_clicked.connect(self._close_con)
         self.set_panel.close_clicked.connect(self._close_set)
         self.set_panel.nav_pos_changed.connect(self._animate_nav)
         self.set_panel.bg_anim_changed.connect(self.bg_canvas.set_enabled)
-
+        self.set_panel.cursor_color_changed.connect(self._on_cursor_color)
+        self.set_panel.top_glow_color_changed.connect(self.bg_canvas.set_top_glow_color)
+        self.set_panel.corner_glow_color_changed.connect(self.bg_canvas.set_corner_glow_color)
         self.p_video.download_saved.connect(self._save_hist)
         self.p_playlist.download_saved.connect(self._save_hist)
-
-        self.glow = CursorGlow(central)
+        self.glow = CursorGlow(central, color=d.get('cursor_color', '#3b82f6'))
         self._place_all()
+
+    def _on_cursor_color(self, color: str):
+        self.glow.set_color(color)
 
     def _place_all(self):
         c = self.centralWidget()
         W = c.width()  or self.width()
         H = c.height() or self.height()
-        lh = self.LOGO_H
-        nh = self.NAV_H
-        pw = self.PANEL_W
-
+        lh = self.LOGO_H; nh = self.NAV_H; pw = self.PANEL_W
         self.bg_canvas.setGeometry(0, 0, W, H)
-        self.glow.setGeometry(0, 0, W, H)
-        self.glow.raise_()
-
+        self.glow.setGeometry(0, 0, W, H); self.glow.raise_()
         self.logo_bar.setGeometry(0, 0, W, lh)
-
         if self._nav_pos == 'top':
             self.tab_nav.setGeometry(0, lh, W, nh)
             self.stack.setGeometry(0, lh + nh, W, H - lh - nh)
         else:
             self.tab_nav.setGeometry(0, H - nh, W, nh)
             self.stack.setGeometry(0, lh, W, H - lh - nh)
-
         cx = W - pw if self._con_open else W
         sx = W - pw if self._set_open else W
         if self._con_anim is None or self._con_anim.state() != QAbstractAnimation.State.Running:
             self.con_panel.setGeometry(cx, 0, pw, H)
         if self._set_anim is None or self._set_anim.state() != QAbstractAnimation.State.Running:
             self.set_panel.setGeometry(sx, 0, pw, H)
-
-        self.logo_bar.raise_()
-        self.tab_nav.raise_()
-        self.con_panel.raise_()
-        self.set_panel.raise_()
-        self.glow.raise_()
+        self.logo_bar.raise_(); self.tab_nav.raise_()
+        self.con_panel.raise_(); self.set_panel.raise_(); self.glow.raise_()
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._place_all()
 
     def _load_prefs(self):
         d = load_data()
-        pos = d.get('nav_position', 'top')
-        bg  = d.get('bg_animate', True)
+        pos          = d.get('nav_position',      'top')
+        bg           = d.get('bg_animate',        True)
+        cursor_color = d.get('cursor_color',      '#3b82f6')
+        top_glow     = d.get('top_glow_color',    '#3b82f6')
+        corner_glow  = d.get('corner_glow_color', '#7c3aed')
         self._nav_pos = pos
         self.tab_nav.set_bottom_style(pos == 'bottom')
         self.set_panel.sync_pos(pos)
         self.bg_canvas.set_enabled(bg)
+        self.bg_canvas.set_top_glow_color(top_glow)
+        self.bg_canvas.set_corner_glow_color(corner_glow)
+        self.glow.set_color(cursor_color)
         self.set_panel.sync_bg(bg)
+        self.set_panel.sync_cursor_color(cursor_color)
+        self.set_panel.sync_top_glow(top_glow)
+        self.set_panel.sync_corner_glow(corner_glow)
         self._place_all()
-        print(f'[Nexus] Loaded: nav_position={pos}, bg_animate={bg}')
+        print(f'[Nexus] Prefs loaded: nav={pos}')
 
     def _save_hist(self, entry):
         d = load_data(); d['history'].insert(0, entry); d['history'] = d['history'][:500]
@@ -2257,27 +2558,20 @@ class NexusApp(QMainWindow):
         old = getattr(self, anim_attr, None)
         if old is not None:
             try:
-                if old.state() == QAbstractAnimation.State.Running:
-                    old.stop()
-            except RuntimeError:
-                pass
+                if old.state() == QAbstractAnimation.State.Running: old.stop()
+            except RuntimeError: pass
         start_x = panel.x()
         end_x   = W - pw if open_it else W
         if open_it:
-            panel.setVisible(True)
-            panel.raise_()
-            self.glow.raise_()
+            panel.setVisible(True); panel.raise_(); self.glow.raise_()
         anim = QPropertyAnimation(panel, QByteArray(b'geometry'))
         anim.setDuration(300)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic if open_it else QEasingCurve.Type.InCubic)
         anim.setStartValue(QRect(start_x, 0, pw, H))
         anim.setEndValue(QRect(end_x, 0, pw, H))
-        setattr(self, anim_attr, anim)
-        setattr(self, open_attr, open_it)
+        setattr(self, anim_attr, anim); setattr(self, open_attr, open_it)
         if not open_it:
-            def _hide():
-                panel.setVisible(False)
-            anim.finished.connect(_hide)
+            anim.finished.connect(lambda: panel.setVisible(False))
         anim.start()
 
     def _on_con_toggle(self, open_it: bool):
@@ -2298,57 +2592,42 @@ class NexusApp(QMainWindow):
         if new_pos == self._nav_pos: return
         c = self.centralWidget(); W = c.width(); H = c.height()
         lh = self.LOGO_H; nh = self.NAV_H
-
         for a in ('_nav_anim', '_stk_anim'):
             old = getattr(self, a, None)
             if old:
                 try:
                     if old.state() == QAbstractAnimation.State.Running: old.stop()
                 except RuntimeError: pass
-
         if new_pos == 'bottom':
-            ns = QRect(0, lh, W, nh)
-            ne = QRect(0, H - nh, W, nh)
-            ss = QRect(0, lh + nh, W, H - lh - nh)
-            se = QRect(0, lh, W, H - lh - nh)
+            ns = QRect(0, lh, W, nh);          ne = QRect(0, H - nh, W, nh)
+            ss = QRect(0, lh + nh, W, H-lh-nh); se = QRect(0, lh, W, H-lh-nh)
         else:
-            ns = QRect(0, H - nh, W, nh)
-            ne = QRect(0, lh, W, nh)
-            ss = QRect(0, lh, W, H - lh - nh)
-            se = QRect(0, lh + nh, W, H - lh - nh)
-
+            ns = QRect(0, H - nh, W, nh);      ne = QRect(0, lh, W, nh)
+            ss = QRect(0, lh, W, H-lh-nh);     se = QRect(0, lh+nh, W, H-lh-nh)
         self.tab_nav.set_bottom_style(new_pos == 'bottom')
-
         self._nav_anim = QPropertyAnimation(self.tab_nav, QByteArray(b'geometry'))
         self._nav_anim.setDuration(400)
         self._nav_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._nav_anim.setStartValue(ns); self._nav_anim.setEndValue(ne)
-
         self._stk_anim = QPropertyAnimation(self.stack, QByteArray(b'geometry'))
         self._stk_anim.setDuration(400)
         self._stk_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._stk_anim.setStartValue(ss); self._stk_anim.setEndValue(se)
-
         def _done():
             self._nav_pos = new_pos
-            self.set_panel.sync_pos(new_pos)
-            self._place_all()
+            self.set_panel.sync_pos(new_pos); self._place_all()
         self._stk_anim.finished.connect(_done)
-        self._nav_anim.start()
-        self._stk_anim.start()
-        print(f'[Nexus] Nav animating → {new_pos}')
+        self._nav_anim.start(); self._stk_anim.start()
+        print(f'[Nexus] Nav → {new_pos}')
 
     def mousePressEvent(self, event):
-        self.glow.click_flash()
-        super().mousePressEvent(event)
+        self.glow.click_flash(); super().mousePressEvent(event)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseMove:
             gpos = QCursor.pos(); lpos = self.centralWidget().mapFromGlobal(gpos)
-            if self.centralWidget().rect().contains(lpos):
-                self.glow.move_to(lpos)
-            else:
-                self.glow.fade_out()
+            if self.centralWidget().rect().contains(lpos): self.glow.move_to(lpos)
+            else: self.glow.fade_out()
         if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
             gpos = QCursor.pos(); lpos = self.centralWidget().mapFromGlobal(gpos)
             if self.centralWidget().rect().contains(lpos):
@@ -2356,6 +2635,8 @@ class NexusApp(QMainWindow):
                     self.glow.click_flash()
         return super().eventFilter(obj, event)
 
+
+# ────────────────────── Entry point ─────────────────────────────────────────
 
 def main():
     app = QApplication(sys.argv)
@@ -2375,7 +2656,7 @@ def main():
     pal.setColor(QPalette.ColorRole.Link,            QColor(C['accent2']))
     app.setPalette(pal)
 
-    print('[Nexus] v7.0 starting…')
+    print('[Nexus] v7.3 starting…')
 
     data_exists = DATA_FILE.exists()
 
@@ -2384,19 +2665,15 @@ def main():
         splash_container.setWindowTitle('Nexus')
         splash_container.resize(1300, 840)
         splash_container.setStyleSheet(f"background:{C['bg']};")
-
         splash = HelloSplash(splash_container)
         splash.resize(splash_container.size())
         splash_container.show()
-
         win = None
-
         def _launch():
             nonlocal win
             splash_container.close()
             win = NexusApp()
             win.show()
-
         splash.finished.connect(_launch)
         splash_container.resizeEvent = lambda e: splash.resize(splash_container.size())
     else:
