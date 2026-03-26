@@ -8,6 +8,8 @@ from functools import partial
 from urllib.parse import urlparse, parse_qs
 import subprocess
 
+softname="Prism"
+
 def pip_install(pkg):
     subprocess.run([sys.executable, '-m', 'pip', 'install', pkg,
                     '--break-system-packages', '-q'], check=False)
@@ -87,7 +89,7 @@ def save_data(d):
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(d, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        _ORIG_OUT.write(f'[Nexus] save_data error: {e}\n')
+        _ORIG_OUT.write(f'[{softname}] save_data error: {e}\n')
 
 # ─────────────────────────── URL helpers ────────────────────────────────────
 
@@ -678,145 +680,255 @@ class ColorPickerBtn(QPushButton):
         self._color = hex_color
         self._refresh()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  NEXUS  –  Premium Splash Screen
+#
+#  Concept: A luminous ring draws itself around the centre. On completion it
+#  pulses outward, sparks fly off the leading tip, and "Nexus" materialises
+#  from inside the ring with a chromatic gradient and layered glow. A thin
+#  gradient line sweeps beneath it. The entire scene breathes once, then
+#  dissolves to black.
+#
+#  Timeline (ticks × 16 ms ≈ seconds):
+#   [ 0 →  12]  Background grid + glows breathe in
+#   [12 →  84]  Ring draws clockwise, tip emits sparks every 3 ticks
+#   [86 → 116]  Ring-close expansion pulse
+#   [90 → 130]  "Nexus" rises + fades in, ring dims to 30 %
+#   [118→ 142]  Separator line sweeps out, end-cap dots pop
+#   [136→ 158]  Subtitle + version fade in
+#   [158→ 370]  Hold
+#   [370→ 416]  Full scene fades to black
+#   [426+]      finished() signal emitted
+#
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ────────────────────── Splash  (HTML-matched stroke-draw → fill+glow) ──────
+import math, random
+from PyQt6.QtWidgets import QWidget
+from PyQt6.QtCore    import Qt, QTimer, QPointF, QRectF, pyqtSignal
+from PyQt6.QtGui     import (
+    QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QFontInfo,
+    QLinearGradient, QRadialGradient, QPainterPath, QConicalGradient,
+)
+
 
 class HelloSplash(QWidget):
-    """
-    Replicates the HTML animation exactly:
-      Phase 0 – stroke draws along the glyph outline  (like stroke-dashoffset → 0)
-      Phase 1 – fill fades in                          (like fillIn keyframe)
-      Phase 2 – glow intensifies + subtitle appears    (drop-shadow)
-      Phase 3 – whole word fades out
-      Then repeats for 'Nexus', then emits finished.
-
-    Key technique: QPainterPath.toFillPolygons() gives us the outline.
-    We walk a *flattened* version of the outline path and draw an
-    ever-growing sub-path — identical to the CSS stroke-dashoffset trick.
-    """
-
-    # ── Tuning ────────────────────────────────────────────────────────────────
-    FONT_PX      = 130          # px size – matches HTML ~5 rem on 1300-wide window
-    DRAW_SPEED   = 0.006        # fraction of outline drawn per 16 ms tick  (~2.6 s total)
-    FILL_SPEED   = 0.030        # fill alpha increment per tick              (~0.9 s)
-    GLOW_SPEED   = 0.025        # glow strength increment
-    HOLD_TICKS   = 75           # ticks to hold after full glow (~1.2 s)
-    FADE_SPEED   = 0.032        # whole-word fade-out speed
-
-    # Colours matching the HTML (#B87333 copper / #FF8C00 orange-glow)
-    STROKE_COLOR = QColor(0x60, 0xa5, 0xfa)          # blue accent – Nexus brand
-    FILL_COLOR   = QColor(0x60, 0xa5, 0xfa)
-    GLOW_COLOR   = QColor(0x3b, 0x82, 0xf6, 0)
 
     finished = pyqtSignal()
 
+    # ── Ring geometry ─────────────────────────────────────────────────────────
+    _RING_DUR    = 72      # ticks to complete ring draw
+    _RING_START  = 12
+    _PULSE_START = 86      # ring-close pulse
+    _NEXUS_START = 90      # text materialises
+    _LINE_START  = 118     # separator line
+    _SUB_START   = 136     # subtitle / version
+    _FADE_START  = 370     # fade to black
+    _FADE_DUR    = 46
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{C['bg']};")
+        self.setStyleSheet('background:#000008;')
+        self._t = 0
 
-        self._word         = 'Hello'
-        self._phase        = 0       # 0=draw 1=fill 2=glow+hold 3=fadeout 4=done
-        self._ticks        = 0
-        self._phase_start  = 0
-        self._draw_t       = 0.0     # 0..1  how much of the outline is drawn
-        self._fill_alpha   = 0.0     # 0..1
-        self._glow_str     = 0.0     # 0..1
-        self._whole_alpha  = 1.0
+        # Ring
+        self._ring_arc   = 0.0   # 0 → 1
+        self._ring_alpha = 0.0
+        self._ring_fade  = 1.0   # dims as nexus appears
+        self._pulse      = 0.0   # 0 → 1 expansion pulse
 
-        self._cache: dict[str, dict] = {}
-        self._precompute('Hello')
-        self._precompute('Nexus')
+        # Sparks
+        self._sparks: list[dict] = []
+
+        # Nexus text
+        self._nex_alpha = 0.0
+        self._nex_glow  = 0.0
+        self._nex_y     = 22.0   # slides to 0
+
+        # Separator
+        self._line_w    = 0.0
+        self._line_a    = 0.0
+        self._dot_a     = 0.0
+
+        # Sub
+        self._sub_a     = 0.0
+        self._ver_a     = 0.0
+
+        # Background
+        self._bg_a      = 0.0
+        self._ox        = 0.0
+        self._oy        = 0.0
+
+        # Master
+        self._master    = 1.0
+
+        # Precompute Nexus path
+        self._npath    = None
+        self._nw       = 0.0
+        self._nh       = 0.0
+        self._precompute_nexus()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(16)
 
-    # ── Font ─────────────────────────────────────────────────────────────────
+    # ── Easing ────────────────────────────────────────────────────────────────
 
-    def _make_font(self) -> QFont:
+    @staticmethod
+    def _eo3(t):
+        t = max(0.0, min(1.0, t))
+        return 1.0 - (1.0 - t) ** 3
+
+    @staticmethod
+    def _eo5(t):
+        t = max(0.0, min(1.0, t))
+        return 1.0 - (1.0 - t) ** 5
+
+    @staticmethod
+    def _eio(t):
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    # ── Precompute ────────────────────────────────────────────────────────────
+
+    def _nexus_font(self) -> QFont:
         f = QFont()
-        # Prefer Outfit (loaded from Google Fonts in HTML); fall back gracefully
-        for family in ('Outfit', 'Segoe UI', 'Ubuntu', 'Arial'):
-            f.setFamily(family)
-            if QFontInfo(f).family().lower() == family.lower():
+        for fam in ('Outfit', 'Segoe UI', 'Ubuntu', 'Arial'):
+            f.setFamily(fam)
+            if QFontInfo(f).family().lower() == fam.lower():
                 break
         f.setWeight(QFont.Weight.Bold)
-        f.setPixelSize(self.FONT_PX)
+        f.setPixelSize(self._nexus_px())
         return f
 
-    # ── Pre-compute outline path & flat point list ────────────────────────────
+    def _nexus_px(self) -> int:
+        side = min(self.width() or 900, self.height() or 600)
+        return max(72, int(side * 0.175))
 
-    def _precompute(self, word: str):
-        font = self._make_font()
-
-        # Build the fill path (centred at origin)
+    def _precompute_nexus(self):
+        fn  = self._nexus_font()
         raw = QPainterPath()
-        raw.addText(0, 0, font, word)
-        br = raw.boundingRect()
-        path = QPainterPath()
-        path.addText(-br.x(), -br.y(), font, word)
+        raw.addText(0, 0, fn, 'PRISM')
+        br  = raw.boundingRect()
+        pp  = QPainterPath()
+        pp.addText(-br.x(), -br.y(), fn, 'PRISM')
+        nb  = pp.boundingRect()
+        self._npath = pp
+        self._nw    = nb.width()
+        self._nh    = nb.height()
 
-        # Flatten the outline into a dense list of (x,y) points
-        # QPainterPath.toSubpathPolygons gives us the outline polygons
-        flat: list[tuple[float, float]] = []
-        for poly in path.toSubpathPolygons():
-            n = poly.count()
-            if n == 0:
-                continue
-            for i in range(n):
-                flat.append((poly[i].x(), poly[i].y()))
-            # close each sub-path back to its start
-            flat.append((poly[0].x(), poly[0].y()))
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._precompute_nexus()
 
-        bounds = path.boundingRect()
-        self._cache[word] = {
-            'path' : path,
-            'pts'  : flat,
-            'w'    : bounds.width(),
-            'h'    : bounds.height(),
-        }
+    # ── Ring radius ───────────────────────────────────────────────────────────
 
-    # ── Animation tick ────────────────────────────────────────────────────────
+    def _ring_r(self) -> float:
+        return min(self.width(), self.height()) * 0.21
+
+    # ── Spark helpers ─────────────────────────────────────────────────────────
+
+    def _spawn_spark(self):
+        angle = self._ring_arc * math.pi * 2 - math.pi / 2
+        R  = self._ring_r()
+        CX = self.width()  / 2
+        CY = self.height() / 2
+        tx = CX + math.cos(angle) * R
+        ty = CY + math.sin(angle) * R
+        spread = (random.random() - 0.5) * 0.9
+        speed  = 0.5 + random.random() * 1.0
+        tang   = angle + math.pi / 2 + spread
+        sign   = 1 if random.random() > 0.5 else -1
+        self._sparks.append({
+            'x':     tx,  'y': ty,
+            'vx':    math.cos(tang) * speed * sign + (random.random()-0.5)*0.35,
+            'vy':    math.sin(tang) * speed - 0.4,
+            'life':  1.0,
+            'decay': 0.020 + random.random() * 0.022,
+            'size':  0.9  + random.random() * 1.3,
+            'hue':   220 if random.random() > 0.5 else 270,
+            'sat':   70  + random.random() * 30,
+        })
+
+    def _update_sparks(self):
+        for s in self._sparks:
+            s['x']  += s['vx']
+            s['y']  += s['vy']
+            s['vy'] += 0.014
+            s['life'] -= s['decay']
+        self._sparks = [s for s in self._sparks if s['life'] > 0]
+
+    # ── Tick ──────────────────────────────────────────────────────────────────
 
     def _tick(self):
-        self._ticks += 1
-        elapsed = self._ticks - self._phase_start
+        self._t += 1
+        t = self._t
+        eo3 = self._eo3
+        eo5 = self._eo5
+        eio = self._eio
 
-        if self._phase == 0:                          # stroke drawing
-            self._draw_t = min(1.0, self._draw_t + self.DRAW_SPEED)
-            if self._draw_t >= 1.0:
-                self._phase = 1; self._phase_start = self._ticks
+        RS = self._RING_START
+        RD = self._RING_DUR
+        PS = self._PULSE_START
+        NS = self._NEXUS_START
+        LS = self._LINE_START
+        SS = self._SUB_START
+        FS = self._FADE_START
+        FD = self._FADE_DUR
 
-        elif self._phase == 1:                        # fill fade-in
-            self._fill_alpha = min(1.0, self._fill_alpha + self.FILL_SPEED)
-            if self._fill_alpha >= 1.0:
-                self._phase = 2; self._phase_start = self._ticks
+        # Background
+        self._bg_a = min(1.0, eo3(t / 14.0))
+        if self._bg_a > 0:
+            self._ox = (self._ox + 0.22) % 52
+            self._oy = (self._oy + 0.13) % 52
 
-        elif self._phase == 2:                        # glow build + hold
-            self._glow_str = min(1.0, self._glow_str + self.GLOW_SPEED)
-            if elapsed >= self.HOLD_TICKS:
-                self._phase = 3; self._phase_start = self._ticks
+        # Ring
+        if t >= RS:
+            rf = (t - RS) / RD
+            self._ring_alpha = min(1.0, eo3(min(rf, 1.0) * 2.0))
+            self._ring_arc   = min(1.0, eo3(rf))
+            if rf < 1.0 and rf > 0.05 and t % 3 == 0:
+                self._spawn_spark()
 
-        elif self._phase == 3:                        # fade out
-            self._whole_alpha = max(0.0, self._whole_alpha - self.FADE_SPEED)
-            if self._whole_alpha <= 0.0:
-                if self._word == 'Hello':
-                    # reset for Nexus
-                    self._word = 'Nexus'
-                    self._draw_t = 0.0; self._fill_alpha = 0.0
-                    self._glow_str = 0.0; self._whole_alpha = 1.0
-                    self._phase = 0; self._phase_start = self._ticks
-                else:
-                    self._phase = 4; self._phase_start = self._ticks
+        # Pulse
+        if t >= PS:
+            self._pulse = min(1.0, eo3((t - PS) / 30.0))
 
-        elif self._phase == 4:
-            if elapsed > 15:
-                self._timer.stop()
-                save_data(load_data())
-                self.finished.emit()
-                return
+        # prism
+        if t >= NS:
+            nf = (t - NS) / 40.0
+            self._nex_alpha = min(1.0, eo5(nf))
+            self._nex_glow  = min(1.0, eo3(nf))
+            self._nex_y     = 22.0 * (1.0 - min(1.0, eo3(nf)))
+            self._ring_fade = max(0.15, 1.0 - eo3(min(1.0, (t - NS) / 60.0)) * 0.85)
+
+        # Line
+        if t >= LS:
+            lf = eo3(min(1.0, (t - LS) / 22.0))
+            side = min(self.width(), self.height())
+            self._line_w  = lf * self._nw * self._master
+            self._line_a  = min(1.0, lf * 3.0)
+        if t >= LS + 18:
+            self._dot_a = eo3(min(1.0, (t - LS - 18) / 14.0))
+
+        # Subtitle
+        if t >= SS:
+            self._sub_a = eo3(min(1.0, (t - SS) / 20.0))
+        if t >= SS + 14:
+            self._ver_a = eo3(min(1.0, (t - SS - 14) / 16.0))
+
+        # Sparks
+        self._update_sparks()
+
+        # Master fade
+        if t >= FS:
+            self._master = max(0.0, 1.0 - eio(min(1.0, (t - FS) / FD)))
 
         self.update()
+
+        if t >= FS + FD + 10:
+            self._timer.stop()
+            self.finished.emit()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
@@ -825,125 +937,269 @@ class HelloSplash(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        # Background
-        p.fillRect(self.rect(), QColor(C['bg']))
+        W  = self.width()
+        H  = self.height()
+        CX = W / 2.0
+        CY = H / 2.0
+        GA = self._master
+        BG = self._bg_a
 
-        # Subtle radial bg glow (matches HTML body dark blue)
-        bg_r = max(self.width(), self.height()) * 0.6
-        bg_g = QRadialGradient(self.width() / 2, self.height() / 2, bg_r)
-        bg_g.setColorAt(0, QColor(20, 30, 60, int(30 * self._whole_alpha)))
-        bg_g.setColorAt(1, QColor(0, 0, 0, 0))
-        p.setBrush(bg_g); p.setPen(Qt.PenStyle.NoPen)
+        # ── Base ──────────────────────────────────────────────────────────────
+        p.fillRect(self.rect(), QColor('#000008'))
+
+        # ── Grid ──────────────────────────────────────────────────────────────
+        if BG > 0.01:
+            p.setPen(QPen(QColor(255, 255, 255, int(BG * 11)), 0.5))
+            x = -self._ox
+            while x <= W + 52:
+                p.drawLine(int(x), 0, int(x), H); x += 52
+            y = -self._oy
+            while y <= H + 52:
+                p.drawLine(0, int(y), W, int(y)); y += 52
+
+        # ── Ambient radial glows ──────────────────────────────────────────────
+        g1 = QRadialGradient(CX, CY * 0.3, W * 0.55)
+        g1.setColorAt(0, QColor(20, 60, 180, int(BG * 30)))
+        g1.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setBrush(g1); p.setPen(Qt.PenStyle.NoPen); p.drawRect(self.rect())
+
+        g2 = QRadialGradient(W * 0.85, H * 0.85, W * 0.45)
+        g2.setColorAt(0, QColor(80, 20, 200, int(BG * 26)))
+        g2.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setBrush(g2); p.drawRect(self.rect())
+
+        # ── Corner brackets ───────────────────────────────────────────────────
+        if BG > 0.01:
+            p.setOpacity(BG * GA * 0.28)
+            p.setPen(QPen(QColor(96, 165, 250), 0.8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            M, L = 32, 22
+            for bx, by, sx, sy in (
+                (M,     M,     +1, +1),
+                (W - M, M,     -1, +1),
+                (M,     H - M, +1, -1),
+                (W - M, H - M, -1, -1),
+            ):
+                p.drawLine(bx + sx*L, by, bx, by)
+                p.drawLine(bx, by, bx, by + sy*L)
+            p.setOpacity(1.0)
+
+        # ── Ring ──────────────────────────────────────────────────────────────
+        R  = self._ring_r()
+        ra = self._ring_alpha * self._ring_fade * GA
+
+        if ra > 0.005 and self._ring_arc > 0.005:
+            start_deg = -90.0
+            span_deg  = self._ring_arc * 360.0
+
+            # Outer halo
+            p.setOpacity(ra * 0.09)
+            p.setPen(QPen(QColor(96, 165, 250), 24))
+            p.drawArc(QRectF(CX-R-12, CY-R-12, (R+12)*2, (R+12)*2),
+                      int(start_deg*16), int(span_deg*16))
+
+            # Mid halo
+            p.setOpacity(ra * 0.16)
+            p.setPen(QPen(QColor(130, 120, 255), 8))
+            p.drawArc(QRectF(CX-R-3, CY-R-3, (R+3)*2, (R+3)*2),
+                      int(start_deg*16), int(span_deg*16))
+
+            # Core arc — rendered in ~90 segments for colour variation
+            SEGS = 90
+            for i in range(SEGS):
+                t0 = i / SEGS
+                t1 = (i + 1) / SEGS
+                if t1 > self._ring_arc: break
+                a0_deg = start_deg + t0 * 360.0
+                a1_deg = start_deg + t1 * 360.0
+
+                frac = t0
+                # Hue 220 (blue) → 270 (violet) → 220
+                hue  = int(220 + math.sin(frac * math.pi) * 55)
+                lite = int(58  + math.sin(frac * math.pi) * 18)
+                col  = QColor.fromHsl(hue, 210, lite)
+                p.setOpacity(ra)
+                p.setPen(QPen(col, 1.5))
+                p.drawArc(QRectF(CX-R, CY-R, R*2, R*2),
+                          int(a0_deg*16), int((a1_deg-a0_deg)*16))
+
+            # Bright leading tip
+            if self._ring_arc < 1.0:
+                tip_rad = (start_deg + span_deg) * math.pi / 180.0
+                tx = CX + math.cos(tip_rad) * R
+                ty = CY + math.sin(tip_rad) * R
+                tg = QRadialGradient(tx, ty, 14)
+                tg.setColorAt(0,   QColor(210, 230, 255, int(ra * 240)))
+                tg.setColorAt(0.3, QColor(150, 180, 255, int(ra * 130)))
+                tg.setColorAt(1,   QColor(96, 165, 250, 0))
+                p.setOpacity(1.0)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(tg)
+                p.drawEllipse(QPointF(tx, ty), 14, 14)
+                p.setBrush(QColor(255, 255, 255, int(ra * 255)))
+                p.drawEllipse(QPointF(tx, ty), 2.8, 2.8)
+
+        # Pulse ring after close
+        if self._pulse > 0 and self._pulse < 1.0:
+            pR = R + self._pulse * 85.0
+            pA = (1.0 - self._pulse) * 0.38 * GA
+            p.setOpacity(pA)
+            p.setPen(QPen(QColor(160, 180, 255), 1.1 * (1-self._pulse)))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(CX, CY), pR, pR)
+            p2R = R + self._pulse * 32.0
+            p2A = (1.0 - self._pulse) * 0.22 * GA
+            p.setOpacity(p2A)
+            p.setPen(QPen(QColor(200, 180, 255), 0.8))
+            p.drawEllipse(QPointF(CX, CY), p2R, p2R)
+            p.setOpacity(1.0)
+
+        # Subtle ring interior fill once prism appears
+        if self._ring_arc >= 1.0 and self._nex_alpha > 0:
+            fg = QRadialGradient(CX, CY, R * 0.88)
+            fg.setColorAt(0,   QColor(59, 130, 246, int(self._nex_alpha * GA * 10)))
+            fg.setColorAt(0.6, QColor(139, 92, 246, int(self._nex_alpha * GA * 8)))
+            fg.setColorAt(1,   QColor(0, 0, 0, 0))
+            p.setBrush(fg); p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(CX, CY), R * 0.88, R * 0.88)
+
+        # ── Sparks ────────────────────────────────────────────────────────────
+        p.setPen(Qt.PenStyle.NoPen)
+        for s in self._sparks:
+            a = s['life'] * self._ring_fade * self._ring_alpha * GA
+            if a < 0.01: continue
+            col = QColor.fromHsl(int(s['hue']), int(s['sat']/100*255), 200)
+            col.setAlphaF(a)
+            p.setBrush(col)
+            r_s = s['size'] * s['life']
+            p.drawEllipse(QPointF(s['x'], s['y']), r_s, r_s)
+
+        # ── Prism ─────────────────────────────────────────────────────────────
+        if self._nex_alpha > 0.003 and self._npath:
+            nw, nh = self._nw, self._nh
+            nx_off = CX
+            ny_off = CY - nh * 0.06 + self._nex_y
+
+            p.save()
+            p.translate(nx_off, ny_off)
+            p.translate(-nw / 2.0, -nh / 2.0)
+
+            # Glow passes (back-to-front, widest first)
+            if self._nex_glow > 0.01:
+                specs = [
+                    (0.085, 0.08, QColor(59, 130, 246)),
+                    (0.052, 0.16, QColor(124, 58, 237)),
+                    (0.026, 0.28, QColor(147, 197, 253)),
+                ]
+                for sd, af, col in specs:
+                    p.save()
+                    p.translate(nw/2, nh/2)
+                    p.scale(1.0+sd, 1.0+sd)
+                    p.translate(-nw/2, -nh/2)
+                    gc = QColor(col)
+                    gc.setAlpha(int(self._nex_glow * af * GA * 255))
+                    p.setBrush(gc); p.setPen(Qt.PenStyle.NoPen)
+                    p.drawPath(self._npath)
+                    p.restore()
+
+            # Main fill gradient
+            gf = QLinearGradient(0, 0, nw, 0)
+            gf.setColorAt(0.00, QColor(147, 197, 253))   # blue-300
+            gf.setColorAt(0.25, QColor( 59, 130, 246))   # blue-500
+            gf.setColorAt(0.60, QColor(139,  92, 246))   # violet-500
+            gf.setColorAt(1.00, QColor(221, 214, 254))   # violet-200
+            p.setOpacity(self._nex_alpha * GA)
+            p.setBrush(gf); p.setPen(Qt.PenStyle.NoPen)
+            p.drawPath(self._npath)
+
+            # Sheen
+            if self._nex_glow > 0.05:
+                sh = QLinearGradient(0, 0, 0, nh * 0.32)
+                sh.setColorAt(0, QColor(255, 255, 255, int(self._nex_glow * GA * 48)))
+                sh.setColorAt(1, QColor(255, 255, 255, 0))
+                p.setBrush(sh)
+                p.drawPath(self._npath)
+
+            p.restore()
+
+        # ── Separator line ────────────────────────────────────────────────────
+        if self._line_a > 0.005:
+            ny_off = CY + self._nh * 0.5 + 28.0
+            half   = self._line_w / 2.0
+
+            if half > 2:
+                lg = QLinearGradient(CX - half, 0, CX + half, 0)
+                lg.setColorAt(0.00, QColor(59, 130, 246,   0))
+                lg.setColorAt(0.18, QColor(96, 165, 250, 140))
+                lg.setColorAt(0.50, QColor(196,181, 253, 220))
+                lg.setColorAt(0.82, QColor(96, 165, 250, 140))
+                lg.setColorAt(1.00, QColor(59, 130, 246,   0))
+                p.setOpacity(self._line_a * GA)
+                p.setPen(QPen(QBrush(lg), 0.85))
+                p.drawLine(QPointF(CX-half, ny_off), QPointF(CX+half, ny_off))
+
+                # End-cap dots
+                if self._dot_a > 0.01:
+                    p.setOpacity(self._dot_a * GA)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    for dx in (CX - half, CX + half):
+                        dg = QRadialGradient(dx, ny_off, 7)
+                        dg.setColorAt(0, QColor(196, 181, 253, 230))
+                        dg.setColorAt(1, QColor(139,  92, 246, 0))
+                        p.setBrush(dg)
+                        p.drawEllipse(QPointF(dx, ny_off), 7, 7)
+                        p.setBrush(QColor(220, 210, 255, 240))
+                        p.drawEllipse(QPointF(dx, ny_off), 1.8, 1.8)
+
+        # ── Subtitle ──────────────────────────────────────────────────────────
+        if self._sub_a > 0.005:
+            ny_off = CY + self._nh * 0.5 + 60.0
+            p.setOpacity(self._sub_a * GA * 0.60)
+            fsub = QFont()
+            for fam in ('Outfit', 'Segoe UI', 'Ubuntu'):
+                fsub.setFamily(fam)
+                if QFontInfo(fsub).family().lower() == fam.lower(): break
+            fsub.setWeight(QFont.Weight.Medium)
+            fsub.setPixelSize(11)
+            fsub.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 4.0)
+            p.setFont(fsub)
+            sub_txt = 'YOUTUBE  ·  MEDIA SUITE'
+            fm_sub  = QFontMetrics(fsub)
+            sw      = fm_sub.horizontalAdvance(sub_txt)
+
+            sg = QLinearGradient(CX - sw/2, 0, CX + sw/2, 0)
+            sg.setColorAt(0.0, QColor( 80, 110, 170))
+            sg.setColorAt(0.5, QColor(140, 160, 210))
+            sg.setColorAt(1.0, QColor( 80, 110, 170))
+            p.setPen(QPen(QBrush(sg), 1))
+            p.drawText(int(CX - sw/2), int(ny_off), sub_txt)
+
+        # ── Version ───────────────────────────────────────────────────────────
+        if self._ver_a > 0.005:
+            ny_off = CY + self._nh * 0.5 + 84.0
+            p.setOpacity(self._ver_a * GA * 0.38)
+            fver = QFont(); fver.setFamily('JetBrains Mono')
+            fver.setPixelSize(10)
+            p.setFont(fver)
+            p.setPen(QColor(40, 40, 60))
+            vw = QFontMetrics(fver).horizontalAdvance('v7.3')
+            p.drawText(int(CX - vw/2), int(ny_off), 'v7.3')
+
+        # ── Vignette edges ────────────────────────────────────────────────────
+        vr = min(W, H) * 0.75
+        ve = QRadialGradient(CX, CY, vr * 0.38, CX, CY, vr)
+        ve.setColorAt(0, QColor(0, 0, 0, 0))
+        ve.setColorAt(1, QColor(0, 0, 8,  int(BG * GA * 150)))
+        p.setOpacity(1.0)
+        p.setBrush(ve); p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(self.rect())
 
-        cache = self._cache.get(self._word)
-        if not cache:
-            p.end(); return
-
-        fill_path = cache['path']
-        pts       = cache['pts']
-        pw, ph    = cache['w'], cache['h']
-
-        # Centre in window
-        tx = (self.width()  - pw) / 2
-        ty = (self.height() - ph) / 2
-
-        p.save()
-        p.translate(tx, ty)
-        p.setOpacity(self._whole_alpha)
-
-        # ── 1. Glow halo behind the text (drop-shadow effect) ─────────────────
-        if self._glow_str > 0:
-            glow_radius = int(40 + 30 * self._glow_str)
-            for radius, alpha in [(glow_radius, int(55 * self._glow_str)),
-                                  (glow_radius // 2, int(90 * self._glow_str))]:
-                # draw the filled path multiple times with expanding blur
-                # We simulate glow by drawing a slightly enlarged blurred fill
-                p.save()
-                glow_c = QColor(C['accent'])
-                glow_c.setAlpha(alpha)
-                p.setBrush(glow_c)
-                p.setPen(Qt.PenStyle.NoPen)
-                # Scale the path slightly outward to give glow spread
-                scale = 1.0 + radius / 400.0
-                cx_path = pw / 2; cy_path = ph / 2
-                p.translate(cx_path, cy_path)
-                p.scale(scale, scale)
-                p.translate(-cx_path, -cy_path)
-                p.drawPath(fill_path)
-                p.restore()
-
-        # ── 2. Filled text (fades in — matches CSS fillIn) ────────────────────
-        if self._fill_alpha > 0:
-            fill_c = QColor(self.FILL_COLOR)
-            fill_c.setAlpha(int(255 * self._fill_alpha))
-            p.setBrush(fill_c)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawPath(fill_path)
-
-        # ── 3. Stroke drawing along the outline ───────────────────────────────
-        if pts and self._draw_t > 0:
-            total   = len(pts)
-            visible = max(2, int(total * self._draw_t))
-
-            stroke_path = QPainterPath()
-            stroke_path.moveTo(pts[0][0], pts[0][1])
-            for i in range(1, visible):
-                stroke_path.lineTo(pts[i][0], pts[i][1])
-
-            # Outer halo (wider, dim) – mimics the HTML glow on the stroke
-            halo_pen = QPen(QColor(59, 130, 246, 45), 10)
-            halo_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            halo_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(halo_pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(stroke_path)
-
-            # Main stroke line (thin, bright – stroke-width:0.8px in HTML)
-            stroke_pen = QPen(self.STROKE_COLOR, 2.2)
-            stroke_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            stroke_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(stroke_pen)
-            p.drawPath(stroke_path)
-
-            # ── Bright moving tip (pen nib effect) ───────────────────────────
-            if visible >= 2:
-                lx, ly = pts[visible - 1]
-
-                # soft outer glow
-                tip_g = QRadialGradient(lx, ly, 18)
-                tip_g.setColorAt(0,   QColor(255, 255, 255, 230))
-                tip_g.setColorAt(0.3, QColor(100, 170, 255, 160))
-                tip_g.setColorAt(1,   QColor(0, 0, 0, 0))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(tip_g)
-                p.drawEllipse(QPointF(lx, ly), 18, 18)
-
-                # bright core dot
-                p.setBrush(QColor(255, 255, 255, 255))
-                p.drawEllipse(QPointF(lx, ly), 3.0, 3.0)
-
-        p.restore()
-
-        # ── 4. Subtitle under 'Nexus' once fully drawn ────────────────────────
-        if self._word == 'Nexus' and self._fill_alpha >= 1.0 and self._phase == 2:
-            sub_alpha = int(200 * min(1.0, self._glow_str) * self._whole_alpha)
-            f2 = self._make_font()
-            f2.setPixelSize(15)
-            f2.setWeight(QFont.Weight.Normal)
-            p.setFont(f2)
-            sub_c = QColor(C['txt2'])
-            sub_c.setAlpha(sub_alpha)
-            p.setPen(sub_c)
-            sub_txt = 'YouTube Media Suite'
-            fm  = QFontMetrics(f2)
-            sub_x = int((self.width() - fm.horizontalAdvance(sub_txt)) / 2)
-            sub_y = int(self.height() / 2 + ph / 2 + 36)
-            p.drawText(sub_x, sub_y, sub_txt)
+        # ── Final fade overlay ────────────────────────────────────────────────
+        if GA < 0.999:
+            ov = QColor(0, 0, 8, int((1.0 - GA) * 255))
+            p.fillRect(self.rect(), ov)
 
         p.end()
-
-
 # ────────────────────── Workers ─────────────────────────────────────────────
 
 class VideoInfoWorker(QThread):
@@ -956,10 +1212,10 @@ class VideoInfoWorker(QThread):
                     'extract_flat': False, 'skip_download': True}
             with yt_dlp.YoutubeDL(opts) as y:
                 info = y.extract_info(self.url, download=False)
-            print(f'[Nexus] Fetched: {info.get("title", "?")}')
+            print(f'[Prism] Fetched: {info.get("title", "?")}')
             self.info_ready.emit(info)
         except Exception as e:
-            print(f'[Nexus] Fetch error: {e}')
+            print(f'[Prism] Fetch error: {e}')
             self.error.emit(str(e))
 
 
@@ -1028,10 +1284,10 @@ class DownloadWorker(QThread):
             with yt_dlp.YoutubeDL(opts) as y:
                 info  = y.extract_info(self.url)
                 fname = yt_dlp.YoutubeDL(opts).prepare_filename(info)
-            print(f'[Nexus] Done: {os.path.basename(fname)}')
+            print(f'[Prism] Done: {os.path.basename(fname)}')
             self.finished.emit(fname)
         except Exception as e:
-            print(f'[Nexus] DL error: {e}')
+            print(f'[Prism] DL error: {e}')
             self.error.emit(str(e))
 
 
@@ -1047,7 +1303,7 @@ class PlaylistInfoWorker(QThread):
                                     'extract_flat': True, 'skip_download': True}) as y:
                 pl = y.extract_info(self.url, download=False)
             entries = pl.get('entries', [])
-            print(f'[Nexus] Playlist: {len(entries)} entries')
+            print(f'[Prism] Playlist: {len(entries)} entries')
             self.total_found.emit(len(entries))
             for i, e in enumerate(entries):
                 if self._stop: return
@@ -1061,7 +1317,7 @@ class PlaylistInfoWorker(QThread):
                 except:
                     self.video_ready.emit(i, e)
         except Exception as e:
-            print(f'[Nexus] Playlist error: {e}')
+            print(f'[Prism] Playlist error: {e}')
             self.error.emit(str(e))
 
 
@@ -1599,9 +1855,9 @@ class SingleVideoPage(QWidget):
     def _fetch(self, url: str):
         clean = normalize_video_url(url)
         if clean != url:
-            print(f'[Nexus] URL normalised → {clean}')
+            print(f'[Prism] URL normalised → {clean}')
         self.search.set_loading('Connecting to YouTube…')
-        print(f'[Nexus] Fetching: {clean}')
+        print(f'[Prism] Fetching: {clean}')
         w = VideoInfoWorker(clean)
         w.info_ready.connect(self._on_info)
         w.error.connect(lambda e: self.search.set_error(e[:140]))
@@ -2131,7 +2387,7 @@ class HistoryPage(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if r == QMessageBox.StandardButton.Yes:
             d = load_data(); d['history'] = []; save_data(d); self.refresh()
-            print('[Nexus] History cleared')
+            print('[Prism] History cleared')
 
 
 # ────────────────────── Console panel ───────────────────────────────────────
@@ -2159,7 +2415,7 @@ class ConsolePanel(QWidget):
         bl.addStretch(); bl.addWidget(clr); lay.addWidget(bot)
         _S_OUT.text_written.connect(self._append, Qt.ConnectionType.QueuedConnection)
         _S_ERR.text_written.connect(self._append_err, Qt.ConnectionType.QueuedConnection)
-        print('[Nexus] Console connected.')
+        print('[Prism] Console connected.')
     def _append(self, t):
         c = self.te.textCursor(); c.movePosition(QTextCursor.MoveOperation.End)
         self.te.setTextCursor(c); self.te.insertPlainText(t)
@@ -2308,7 +2564,7 @@ class SettingsPanel(QWidget):
         d['top_glow_color']     = self._top_glow_color
         d['corner_glow_color']  = self._corner_glow_color
         save_data(d)
-        print(f'[Nexus] Settings saved → nav={self._pending}')
+        print(f'[Prism] Settings saved → nav={self._pending}')
         self.nav_pos_changed.emit(self._pending)
         self.save_btn.setText('✓  Saved!')
         QTimer.singleShot(1600, lambda: self.save_btn.setText('  Save Settings  ↓'))
@@ -2341,7 +2597,7 @@ class LogoBar(QWidget):
         self.setObjectName('logoBar')
         lay = QHBoxLayout(self); lay.setContentsMargins(24, 0, 24, 0); lay.setSpacing(0)
         dot  = BreatheDot(C['accent'], 8)
-        logo = QLabel('Nexus'); logo.setObjectName('logoLabel')
+        logo = QLabel('Prism'); logo.setObjectName('logoLabel')
         lay.addWidget(dot); lay.addSpacing(8); lay.addWidget(logo); lay.addStretch()
         ver = QLabel('v7.3'); ver.setObjectName('versionLabel'); lay.addWidget(ver)
 
@@ -2449,7 +2705,7 @@ class NexusApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Nexus — YouTube Media Suite v7.3')
+        self.setWindowTitle('Prism — YouTube Media Suite v7.3')
         self.setMinimumSize(1080, 700); self.resize(1300, 840)
         self._nav_pos  = 'top'
         self._con_open = False
@@ -2546,12 +2802,12 @@ class NexusApp(QMainWindow):
         self.set_panel.sync_top_glow(top_glow)
         self.set_panel.sync_corner_glow(corner_glow)
         self._place_all()
-        print(f'[Nexus] Prefs loaded: nav={pos}')
+        print(f'[Prism] Prefs loaded: nav={pos}')
 
     def _save_hist(self, entry):
         d = load_data(); d['history'].insert(0, entry); d['history'] = d['history'][:500]
         save_data(d); self.p_history.refresh()
-        print(f'[Nexus] Saved to history: {entry.get("title", "?")}')
+        print(f'[Prism] Saved to history: {entry.get("title", "?")}')
 
     def _slide(self, panel: QWidget, open_it: bool, anim_attr: str, open_attr: str):
         c = self.centralWidget(); W = c.width(); H = c.height(); pw = self.PANEL_W
@@ -2618,7 +2874,7 @@ class NexusApp(QMainWindow):
             self.set_panel.sync_pos(new_pos); self._place_all()
         self._stk_anim.finished.connect(_done)
         self._nav_anim.start(); self._stk_anim.start()
-        print(f'[Nexus] Nav → {new_pos}')
+        print(f'[Prism] Nav → {new_pos}')
 
     def mousePressEvent(self, event):
         self.glow.click_flash(); super().mousePressEvent(event)
@@ -2640,7 +2896,7 @@ class NexusApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName('Nexus'); app.setStyle('Fusion')
+    app.setApplicationName('Prism'); app.setStyle('Fusion')
     app.setStyleSheet(STYLESHEET)
 
     pal = QPalette()
@@ -2656,13 +2912,13 @@ def main():
     pal.setColor(QPalette.ColorRole.Link,            QColor(C['accent2']))
     app.setPalette(pal)
 
-    print('[Nexus] v7.3 starting…')
+    print('[Prism] v7.3 starting…')
 
     data_exists = DATA_FILE.exists()
 
     if not data_exists:
         splash_container = QWidget()
-        splash_container.setWindowTitle('Nexus')
+        splash_container.setWindowTitle('Prism')
         splash_container.resize(1300, 840)
         splash_container.setStyleSheet(f"background:{C['bg']};")
         splash = HelloSplash(splash_container)
